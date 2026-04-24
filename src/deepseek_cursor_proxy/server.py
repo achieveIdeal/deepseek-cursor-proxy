@@ -88,16 +88,11 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                 404, {"error": {"message": "Only /v1/chat/completions is supported"}}
             )
             return
-        if not self._authorized():
+        cursor_authorization = self._cursor_authorization()
+        if cursor_authorization is None:
             self._send_json(
-                401, {"error": {"message": "Missing or invalid proxy API key"}}
+                401, {"error": {"message": "Missing Authorization bearer token"}}
             )
-            return
-
-        try:
-            self.config.validate()
-        except ValueError as exc:
-            self._send_json(500, {"error": {"message": str(exc)}})
             return
 
         try:
@@ -148,7 +143,10 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
             upstream_url,
             data=upstream_body,
             method="POST",
-            headers=self._upstream_headers(stream=bool(prepared.payload.get("stream"))),
+            headers=self._upstream_headers(
+                stream=bool(prepared.payload.get("stream")),
+                authorization=cursor_authorization,
+            ),
         )
 
         try:
@@ -193,12 +191,12 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                     response, prepared.original_model, prepared.payload["messages"]
                 )
 
-    def _authorized(self) -> bool:
-        expected = self.config.proxy_api_key
-        if expected is None:
-            return True
+    def _cursor_authorization(self) -> str | None:
         auth_header = self.headers.get("Authorization", "")
-        return auth_header == f"Bearer {expected}"
+        scheme, separator, token = auth_header.strip().partition(" ")
+        if separator != " " or scheme.lower() != "bearer" or not token.strip():
+            return None
+        return f"Bearer {token.strip()}"
 
     def _send_cors_headers(self) -> None:
         self.send_header("Access-Control-Allow-Origin", "*")
@@ -223,20 +221,14 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
 
     def _send_models(self) -> None:
         created = int(time.time())
-        seen: set[str] = set()
-        models = []
-        for model_id in (self.config.upstream_model, *self.config.model_list):
-            if model_id in seen:
-                continue
-            seen.add(model_id)
-            models.append(
-                {
-                    "id": model_id,
-                    "object": "model",
-                    "created": created,
-                    "owned_by": "deepseek",
-                }
-            )
+        models = [
+            {
+                "id": self.config.upstream_model,
+                "object": "model",
+                "created": created,
+                "owned_by": "deepseek",
+            }
+        ]
         self._send_json(200, {"object": "list", "data": models})
 
     def _read_json_body(self) -> dict[str, Any]:
@@ -252,9 +244,9 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
             raise ValueError("Request body must be a JSON object")
         return payload
 
-    def _upstream_headers(self, stream: bool) -> dict[str, str]:
+    def _upstream_headers(self, stream: bool, authorization: str) -> dict[str, str]:
         headers = {
-            "Authorization": f"Bearer {self.config.upstream_api_key}",
+            "Authorization": authorization,
             "Content-Type": "application/json",
             "Accept": "text/event-stream" if stream else "application/json",
             "Accept-Encoding": "identity",
@@ -399,19 +391,23 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--config",
         dest="config_path",
         type=Path,
-        help=f"Env config file, default {default_config_path()}",
+        help=f"YAML config file, default {default_config_path()}",
     )
     parser.add_argument(
-        "--host", help="Bind host, default from PROXY_HOST or 127.0.0.1"
+        "--host", help="Bind host, default from config, PROXY_HOST, or 127.0.0.1"
     )
     parser.add_argument(
-        "--port", type=int, help="Bind port, default from PROXY_PORT or 9000"
+        "--port",
+        type=int,
+        help="Bind port, default from config, PROXY_PORT, or 9000",
     )
     parser.add_argument(
-        "--model", help="Upstream DeepSeek model, default from DEEPSEEK_MODEL"
+        "--model",
+        help="Upstream DeepSeek model, default from config, DEEPSEEK_MODEL, or deepseek-v4-pro",
     )
     parser.add_argument(
-        "--base-url", help="DeepSeek base URL, default https://api.deepseek.com"
+        "--base-url",
+        help="DeepSeek base URL, default from config, DEEPSEEK_BASE_URL, or https://api.deepseek.com",
     )
     parser.add_argument(
         "--reasoning-content-path",
@@ -505,7 +501,11 @@ def main(argv: list[str] | None = None) -> int:
         level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s"
     )
     args = build_arg_parser().parse_args(argv)
-    config = ProxyConfig.from_env(env_file_path=args.config_path)
+    try:
+        config = ProxyConfig.from_file(config_path=args.config_path)
+    except ValueError as exc:
+        LOG.error("%s", exc)
+        return 2
     updates: dict[str, Any] = {}
     if args.host:
         updates["host"] = args.host
@@ -527,12 +527,6 @@ def main(argv: list[str] | None = None) -> int:
         updates["cursor_display_reasoning"] = False
     if updates:
         config = replace(config, **updates)
-
-    try:
-        config.validate()
-    except ValueError as exc:
-        LOG.error("%s", exc)
-        return 2
 
     store = ReasoningStore(config.reasoning_content_path)
     server = DeepSeekProxyServer((config.host, config.port), DeepSeekProxyHandler)
@@ -572,8 +566,6 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         LOG.info("ngrok tunnel forwarding %s -> %s", public_url, target_url)
         LOG.info("Cursor Base URL: %s/v1", public_url.rstrip("/"))
-        if config.proxy_api_key:
-            LOG.info("Cursor API key: value of PROXY_API_KEY")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
