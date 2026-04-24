@@ -34,7 +34,7 @@ Provider returned error:
 
 Cursor blocks non-public API URLs such as `localhost`, so the proxy needs a public HTTPS URL. [ngrok](https://ngrok.com/) can expose the local proxy to Cursor without opening router ports. Alternatively, you may use [Cloudflare Tunnel](https://developers.cloudflare.com/tunnel/setup/).
 
-Create an ngrok account, then visit ngrok's Dashboard: https://dashboard.ngrok.com
+Create an ngrok account, then visit ngrok's dashboard: https://dashboard.ngrok.com
 
 ![ngrok dashboard](assets/ngrok_dashboard.png)
 
@@ -53,7 +53,7 @@ In Cursor, add the DeepSeek custom model and point it at this proxy:
 - API Key: your DeepSeek API key
 - Base URL: your ngrok HTTPS URL with the `/v1` API version path
 
-The proxy respects the DeepSeek model name Cursor sends, such as `deepseek-v4-pro` or `deepseek-v4-flash`. The `model` field in `config.yaml` is only the fallback used when a request does not include a model.
+The proxy respects the DeepSeek model name Cursor sends, such as `deepseek-v4-pro` or `deepseek-v4-flash`. The `model` field in `config.yaml` is used as a fallback only when a request does not include a model.
 
 For example, if ngrok dashboard shows `https://example.ngrok-free.app`, use:
 
@@ -68,27 +68,56 @@ Note: you can toggle the custom API on and off with:
 - macOS: `Cmd+Shift+0`
 - Windows/Linux: `Ctrl+Shift+0`
 
-### Step 3: Start the Proxy Server
+### Step 3: Install and Start the Proxy Server
 
-Install and run the proxy:
+**TL;DR Version**
 
 ```bash
-# Or, use your favourite Python env manager
-conda create -n dcp python=3.10 -y
-conda activate dcp
-
-# Install
+# Install (activate your Python environment first)
 git clone https://github.com/yxlao/deepseek-cursor-proxy.git
 cd deepseek-cursor-proxy
 pip install -e .
 
-# Run
+# Start
 deepseek-cursor-proxy
 ```
 
-The proxy creates `~/.deepseek-cursor-proxy/config.yaml` on first run.
+**Full Instructions with UV**
 
-This will also print the ngrok public URL. If it differs from the one in Cursor, update it in Cursor's Base URL field.
+```bash
+# Install uv if you don't have it
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Install
+git clone https://github.com/yxlao/deepseek-cursor-proxy.git
+cd deepseek-cursor-proxy
+uv sync
+source .venv/bin/activate
+
+# Start
+deepseek-cursor-proxy
+```
+
+**Full Instructions with Conda**
+
+```bash
+# Install
+conda create -n dcp python=3.10 -y
+conda activate dcp
+git clone https://github.com/yxlao/deepseek-cursor-proxy.git
+cd deepseek-cursor-proxy
+pip install -e .
+
+# Start
+deepseek-cursor-proxy
+```
+
+On start, `deepseek-cursor-proxy` will print the ngrok public URL. If it differs from the one in Cursor, update it in Cursor's Base URL field.
+
+On the first run, `deepseek-cursor-proxy` will create:
+
+- `~/.deepseek-cursor-proxy/config.yaml`: the configuration file
+- `~/.deepseek-cursor-proxy/reasoning_content.sqlite3`: the reasoning content cache
 
 ### Step 4: Chat with DeepSeek in Cursor
 
