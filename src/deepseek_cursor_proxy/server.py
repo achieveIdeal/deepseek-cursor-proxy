@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import replace
 import gzip
+from http.client import HTTPException
 import json
 import logging
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -24,7 +25,7 @@ from .reasoning_store import ReasoningStore, conversation_scope
 from .streaming import CursorReasoningDisplayAdapter, StreamAccumulator
 from .tunnel import NgrokTunnel, local_tunnel_target
 from .transform import (
-    PLACEHOLDER_REASONING_CONTENT,
+    RECOVERY_NOTICE_CONTENT,
     prepare_upstream_request,
     rewrite_response_body,
 )
@@ -137,22 +138,32 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                 "restored reasoning_content on %s assistant message(s)",
                 prepared.patched_reasoning_messages,
             )
-        if prepared.placeholder_reasoning_messages:
+        if prepared.recovered_reasoning_messages:
+            if prepared.recovery_notice:
+                LOG.warning(
+                    (
+                        "recovered request because cached reasoning_content was "
+                        "unavailable for %s assistant message(s); omitted %s "
+                        "older message(s) from forwarded history and will show "
+                        "a Cursor notice"
+                    ),
+                    prepared.recovered_reasoning_messages,
+                    prepared.recovery_dropped_messages,
+                )
+            else:
+                LOG.info(
+                    (
+                        "continued recovered request; omitted %s old message(s) "
+                        "before the prior recovery boundary"
+                    ),
+                    prepared.recovery_dropped_messages,
+                )
+        if prepared.missing_reasoning_messages:
             LOG.warning(
                 (
-                    "inserted placeholder reasoning_content on %s assistant "
-                    "message(s); this is compatibility mode and may still be "
-                    "rejected by DeepSeek"
+                    "strict missing-reasoning mode rejected request path=%s "
+                    "status=409 reason=missing_reasoning_content count=%s"
                 ),
-                prepared.placeholder_reasoning_messages,
-            )
-        if prepared.missing_reasoning_messages:
-            diagnostic_placeholder = (
-                f"{PLACEHOLDER_REASONING_CONTENT} "
-                "[not sent upstream because missing_reasoning_strategy=reject]"
-            )
-            LOG.warning(
-                "rejected request path=%s status=409 reason=missing_reasoning_content count=%s",
                 request_path,
                 prepared.missing_reasoning_messages,
             )
@@ -161,26 +172,28 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                 {
                     "error": {
                         "message": (
-                            "Missing cached DeepSeek reasoning_content for a "
-                            f"thinking-mode tool-call history on "
+                            "deepseek-cursor-proxy is running in strict "
+                            "missing-reasoning mode and cannot automatically "
+                            "recover this thinking-mode tool-call history because "
+                            "cached DeepSeek reasoning_content is missing for "
                             f"{prepared.missing_reasoning_messages} assistant "
-                            "message(s). This usually means the chat has tool-call "
-                            "turns that were not captured by this proxy/cache. Start "
-                            "a new chat or retry from the original tool-call turn."
+                            "message(s). Restart without "
+                            "`--missing-reasoning-strategy reject`, or pass "
+                            "`--missing-reasoning-strategy recover`, so the proxy "
+                            "can recover from partial chat history automatically."
                         ),
                         "type": "missing_reasoning_content",
                         "code": "missing_reasoning_content",
                         "missing_reasoning_messages": prepared.missing_reasoning_messages,
-                        "diagnostic_placeholder": diagnostic_placeholder,
                     }
                 },
             )
             return
         LOG.info(
-            "deepseek send: %s patched=%s placeholder=%s",
+            "deepseek send: %s patched=%s recovered=%s",
             compact_request_stats(prepared.payload),
             prepared.patched_reasoning_messages,
-            prepared.placeholder_reasoning_messages,
+            prepared.recovered_reasoning_messages,
         )
 
         if self.config.verbose:
@@ -252,6 +265,7 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                     prepared.original_model,
                     prepared.payload["messages"],
                     prepared.cache_namespace,
+                    prepared.recovery_notice,
                 )
             else:
                 sent_response = self._proxy_regular_response(
@@ -259,19 +273,21 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                     prepared.original_model,
                     prepared.payload["messages"],
                     prepared.cache_namespace,
+                    prepared.recovery_notice,
                 )
             if not sent_response:
                 return
             LOG.info(
                 (
                     "request complete status=%s stream=%s elapsed_ms=%s "
-                    "patched_reasoning=%s missing_reasoning=%s"
+                    "patched_reasoning=%s missing_reasoning=%s recovered_reasoning=%s"
                 ),
                 upstream_status,
                 bool(prepared.payload.get("stream")),
                 elapsed_ms(started),
                 prepared.patched_reasoning_messages,
                 prepared.missing_reasoning_messages,
+                prepared.recovered_reasoning_messages,
             )
 
     def _cursor_authorization(self) -> str | None:
@@ -419,6 +435,7 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
         original_model: str,
         request_messages: list[dict[str, Any]],
         cache_namespace: str,
+        recovery_notice: str | None = None,
     ) -> bool:
         body = read_response_body(response)
         try:
@@ -428,6 +445,7 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                 self.reasoning_store,
                 request_messages,
                 cache_namespace,
+                content_prefix=recovery_notice,
             )
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
             LOG.warning("failed to rewrite upstream JSON response: %s", exc)
@@ -457,6 +475,7 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
         original_model: str,
         request_messages: list[dict[str, Any]],
         cache_namespace: str,
+        recovery_notice: str | None = None,
     ) -> bool:
         sent_headers = self._send_response_headers(
             getattr(response, "status", 200),
@@ -479,12 +498,22 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
         )
         scope = conversation_scope(request_messages, cache_namespace)
         finalized = False
+        pending_recovery_notice = recovery_notice
         while True:
-            line = response.readline()
+            try:
+                line = response.readline()
+            except (HTTPException, OSError) as exc:
+                LOG.warning("upstream streaming response read failed: %s", exc)
+                return False
             if not line:
                 break
-            rewritten, finalized = self._rewrite_sse_line(
-                line, original_model, accumulator, scope, display_adapter
+            rewritten, finalized, pending_recovery_notice = self._rewrite_sse_line(
+                line,
+                original_model,
+                accumulator,
+                scope,
+                display_adapter,
+                pending_recovery_notice,
             )
             if not self._write_to_client(
                 rewritten, "sending streaming response chunk", flush=True
@@ -508,10 +537,11 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
         accumulator: StreamAccumulator,
         scope: str,
         display_adapter: CursorReasoningDisplayAdapter | None,
-    ) -> tuple[bytes, bool]:
+        recovery_notice: str | None = None,
+    ) -> tuple[bytes, bool, str | None]:
         stripped = line.strip()
         if not stripped.startswith(b"data:"):
-            return line, False
+            return line, False, recovery_notice
 
         data = stripped[len(b"data:") :].strip()
         if data == b"[DONE]":
@@ -520,19 +550,30 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
             stored = accumulator.store_reasoning(self.reasoning_store, scope)
             if stored:
                 LOG.info("stored %s streaming reasoning cache key(s)", stored)
+            prefix = b""
             if display_adapter is None:
-                return b"data: [DONE]\n\n", True
+                if recovery_notice:
+                    prefix += sse_data(
+                        recovery_notice_chunk(original_model, recovery_notice)
+                    )
+                return prefix + b"data: [DONE]\n\n", True, None
             closing_chunk = display_adapter.flush_chunk(original_model)
-            if closing_chunk is None:
-                return b"data: [DONE]\n\n", True
-            return sse_data(closing_chunk) + b"data: [DONE]\n\n", True
+            if closing_chunk is not None:
+                prefix += sse_data(closing_chunk)
+            if recovery_notice:
+                prefix += sse_data(
+                    recovery_notice_chunk(original_model, recovery_notice)
+                )
+            return prefix + b"data: [DONE]\n\n", True, None
 
         try:
             chunk = json.loads(data.decode("utf-8"))
         except (json.JSONDecodeError, UnicodeDecodeError):
-            return line, False
+            return line, False, recovery_notice
 
         if isinstance(chunk, dict):
+            if recovery_notice and inject_recovery_notice(chunk, recovery_notice):
+                recovery_notice = None
             accumulator.ingest_chunk(chunk)
             stored = accumulator.store_ready_reasoning(self.reasoning_store, scope)
             if stored:
@@ -544,13 +585,17 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                 chunk["model"] = original_model
             ending = b"\r\n" if line.endswith(b"\r\n") else b"\n"
             return (
-                b"data: "
-                + json.dumps(chunk, ensure_ascii=False, separators=(",", ":")).encode(
-                    "utf-8"
-                )
-                + ending
-            ), False
-        return line, False
+                (
+                    b"data: "
+                    + json.dumps(
+                        chunk, ensure_ascii=False, separators=(",", ":")
+                    ).encode("utf-8")
+                    + ending
+                ),
+                False,
+                recovery_notice,
+            )
+        return line, False, recovery_notice
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -602,10 +647,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--missing-reasoning-strategy",
-        choices=["reject", "placeholder"],
+        choices=["recover", "reject"],
         help=(
-            "What to do when required reasoning_content is missing: reject "
-            "(safe default) or placeholder (unsafe compatibility fallback)"
+            "What to do when required reasoning_content is missing: "
+            "recover (friendly default) or reject (strict debugging mode)"
         ),
     )
     parser.add_argument(
@@ -740,6 +785,45 @@ def sse_data(payload: dict[str, Any]) -> bytes:
     )
 
 
+def inject_recovery_notice(chunk: dict[str, Any], notice: str) -> bool:
+    choices = chunk.get("choices")
+    if not isinstance(choices, list):
+        return False
+    for choice in choices:
+        if not isinstance(choice, dict):
+            continue
+        delta = choice.get("delta")
+        if not isinstance(delta, dict):
+            continue
+        if "content" not in delta and not delta.get("tool_calls"):
+            continue
+        existing_content = delta.get("content")
+        delta["content"] = notice + (
+            existing_content if isinstance(existing_content, str) else ""
+        )
+        return True
+    return False
+
+
+def recovery_notice_chunk(
+    model: str,
+    notice: str = RECOVERY_NOTICE_CONTENT,
+) -> dict[str, Any]:
+    return {
+        "id": "chatcmpl-deepseek-cursor-proxy-recovery",
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "delta": {"content": notice},
+                "finish_reason": None,
+            }
+        ],
+    }
+
+
 def summarize_chat_payload(payload: dict[str, Any]) -> str:
     messages = payload.get("messages")
     tools = payload.get("tools")
@@ -841,14 +925,6 @@ def main(argv: list[str] | None = None) -> int:
         config.missing_reasoning_strategy,
         config.reasoning_content_path,
     )
-    if config.missing_reasoning_strategy == "placeholder":
-        LOG.warning(
-            (
-                "missing_reasoning_strategy=placeholder is not DeepSeek-compliant; "
-                "use only to test old Cursor histories whose original reasoning "
-                "cannot be recovered"
-            )
-        )
     if config.verbose:
         LOG.info("logging mode=verbose metadata=detailed bodies=true")
         LOG.warning(
