@@ -1,8 +1,9 @@
-<h1><img src="assets/logo.png" width="90" alt="deepseek-cursor-proxy logo" style="vertical-align: middle;"> deepseek-cursor-proxy</h1>
+<!-- <h1><img src="assets/logo.png" width="120" alt="deepseek-cursor-proxy logo" style="vertical-align: middle;">&nbsp;DeepSeek Cursor Proxy</h1> -->
+<h1 align="center"><img src="assets/logo.png" width="150" alt="deepseek-cursor-proxy logo"><br>DeepSeek Cursor Proxy</h1>
 
 A compatibility proxy that connects Cursor to DeepSeek thinking models (`deepseek-v4-pro` and `deepseek-v4-flash`) by properly handling the `reasoning_content` field for DeepSeek tool-call reasoning API requests.
 
-This proxy can also help _other applications and coding agents_ beyond Cursor that run into the same missing `reasoning_content` issue with DeepSeek's thinking-mode API. Just point their API base URL at the proxy.
+This proxy can also help **other applications and coding agents** beyond Cursor that run into the same missing `reasoning_content` issue with DeepSeek's thinking-mode API. Just point their API base URL at the proxy.
 
 ## What It Does
 
@@ -34,11 +35,9 @@ Provider returned error:
 
 ### Step 1: Set Up ngrok
 
-Cursor blocks non-public API URLs such as `localhost`, so the proxy needs a public HTTPS URL. [ngrok](https://ngrok.com/) can expose the local proxy to Cursor without opening router ports. Alternatively, you may use [Cloudflare Tunnel](https://developers.cloudflare.com/tunnel/setup/).
+Cursor blocks non-public API URLs such as `localhost`, so the proxy needs a public HTTPS URL. [ngrok](https://ngrok.com/) can expose the local proxy to Cursor without opening router ports. Alternatively, you may use [Cloudflare Tunnel](https://developers.cloudflare.com/tunnel/setup/). Create an ngrok account and visit [ngrok's dashboard](https://dashboard.ngrok.com). You will find the authtoken and public URL there.
 
 If you're using this proxy with another application that allows localhost API endpoints, you can skip this step entirely by setting `ngrok: false` in `~/.deepseek-cursor-proxy/config.yaml`, or by starting the proxy with `--no-ngrok`.
-
-Create an ngrok account, then visit ngrok's dashboard: https://dashboard.ngrok.com
 
 <img src="assets/ngrok_dashboard.png" width="600" alt="ngrok dashboard">
 
@@ -59,10 +58,10 @@ In Cursor, add the DeepSeek custom model and point it at this proxy:
 
 The proxy respects the DeepSeek model name Cursor sends, such as `deepseek-v4-pro` or `deepseek-v4-flash`. The `model` field in `config.yaml` is used as a fallback only when a request does not include a model.
 
-For example, if ngrok dashboard shows `https://example.ngrok-free.app`, use:
+For example, if ngrok dashboard shows `https://example.ngrok-free.dev`, use:
 
 ```text
-https://example.ngrok-free.app/v1
+https://example.ngrok-free.dev/v1
 ```
 
 <img src="assets/cursor_config.png" width="600" alt="Cursor settings for DeepSeek through the proxy">
@@ -121,12 +120,10 @@ Select `deepseek-v4-pro` in Cursor and use chat or agent mode as usual.
 
 ## How It Works
 
-DeepSeek's [thinking mode](https://api-docs.deepseek.com/guides/thinking_mode#tool-calls) requires `reasoning_content` from assistant messages in tool-call sequences to be passed back in later requests. Cursor may omit this field, causing DeepSeek to return a 400 error. This proxy sits between Cursor and DeepSeek (`Cursor → ngrok → proxy → DeepSeek API`) and repairs requests when it has the exact original reasoning cached.
-
-- **Core fix:** every DeepSeek response, streaming or non-streaming, has its `reasoning_content` stored in a local SQLite cache keyed by message signature, tool-call ID, and tool-call function signature. On outgoing thinking-mode requests, the proxy restores missing `reasoning_content` for tool-call-related assistant messages and sends the complete history to DeepSeek. If the cache is cold, such as after a proxy restart or model switch, the default recovery mode omits older unrecoverable tool-call history, continues from the latest user request, logs the recovery, and prefixes the next Cursor response with a small notice.
-- **Multi-conversation isolation:** cache keys are scoped by a SHA-256 hash of the canonical conversation prefix (roles, content, tool calls, excluding `reasoning_content`) plus the upstream model/configuration and an API-key hash. Concurrent or interleaved threads with different histories get different scopes, so reused tool-call IDs do not collide. Byte-identical cloned histories are indistinguishable unless Cursor sends a differentiating history.
-- **DeepSeek [context caching](https://api-docs.deepseek.com/guides/kv_cache) compatibility:** the proxy does not inject synthetic thread IDs, timestamps, or cache-control messages into the prompt. When it restores cached reasoning, it restores the exact original string, preserving repeated prefixes for DeepSeek's automatic best-effort context cache.
-- **Additional compatibility fixes:** the proxy converts legacy `functions`/`function_call` fields to `tools`/`tool_choice`, preserves required and named tool-choice semantics, normalizes `reasoning_effort` aliases per DeepSeek docs, strips mirrored `<think>` blocks from assistant content, converts multi-part content arrays to plain text, logs DeepSeek prompt-cache usage when available, and mirrors `reasoning_content` into Cursor-visible `<think>...</think>` blocks for thinking display.
+- **Core fix:** DeepSeek's [thinking mode](https://api-docs.deepseek.com/guides/thinking_mode#tool-calls) requires `reasoning_content` from assistant tool-call messages to be passed back in subsequent requests, but Cursor omits this field, causing a 400 error. The proxy (`Cursor → ngrok → proxy → DeepSeek API`) stores `reasoning_content` from every DeepSeek response in a local SQLite cache, keyed by message signature, tool-call ID, and tool-call function signature, and patches outgoing requests with missing `reasoning_content` before they reach DeepSeek. On a cold cache (proxy restart, model switch), it logs and drops unrecoverable history, continues from the latest user request, and prefixes the next Cursor response with a notice.
+- **Multi-conversation isolation:** To avoid collisions across concurrent conversations, the proxy scopes cache keys by a SHA-256 hash of the canonical conversation prefix (roles, content, and tool calls, excluding `reasoning_content`) plus the upstream model, configuration, and an API-key hash. Different threads get different scopes, so reused tool-call IDs do not collide. Byte-identical cloned histories produce identical scopes.
+- **Context caching compatibility:** The proxy preserves compatibility by never injecting synthetic thread IDs, timestamps, or cache-control messages. It restores `reasoning_content` as the exact original string, so repeated prefixes remain intact for [DeepSeek context cache](https://api-docs.deepseek.com/guides/kv_cache). Cache hit rates are logged in the terminal output.
+- **Additional compatibility fixes:** Beyond reasoning repair, the proxy converts legacy `functions`/`function_call` fields to `tools`/`tool_choice`, preserves required and named tool-choice semantics, normalizes `reasoning_effort` aliases, strips mirrored `<think>` blocks from assistant content, flattens multi-part content arrays to plain text, and mirrors `reasoning_content` into Cursor-visible `<think>...</think>` blocks.
 
 ## Development
 
@@ -144,8 +141,6 @@ uv run pre-commit run --all-files
 ```
 
 ## Debugging
-
-Normal logs avoid request/response bodies but still print compact request and usage statistics. `rounds` is the number of user turns in the forwarded history, `reasoning` is the number and character size of `reasoning_content` fields sent to DeepSeek, and `cache=hit/miss` comes from DeepSeek's `usage.prompt_cache_hit_tokens` / `prompt_cache_miss_tokens`.
 
 Run with verbose output:
 
