@@ -585,17 +585,33 @@ class ProxyEndToEndTests(unittest.TestCase):
             )
 
         output = "\n".join(captured.output)
+        stage_records = [
+            record
+            for record in captured.output
+            if any(
+                marker in record
+                for marker in ("┌ cursor", "├ context", "├ send", "└ stats")
+            )
+        ]
         self.assertEqual(status, 200)
-        self.assertIn("cursor request: model='deepseek-v4-pro'", output)
+        self.assertEqual(len(stage_records), 4)
+        self.assertTrue(all("\n" not in record for record in stage_records))
         self.assertIn(
-            "deepseek send: model=deepseek-v4-pro stream=0 rounds=1 msgs=1 tools=1 reasoning=0/0ch",
+            "┌ cursor  model=deepseek-v4-pro messages=1 tools=1",
             output,
         )
         self.assertIn(
-            "deepseek usage: prompt=20 completion=5 total=25 cache=12/8 hit=60.0% reasoning=3",
+            "├ context filled=0 missing=0 recovered=0 dropped=0 status=ok",
             output,
         )
-        self.assertIn("request complete status=200", output)
+        self.assertIn(
+            "├ send    user_msgs=1 messages=1 tools=1 reasoning_content=0",
+            output,
+        )
+        self.assertIn(
+            "└ stats   prompt=20 output=5 reasoning=3 cache_hit=60.0%",
+            output,
+        )
         self.assertNotIn("What is tomorrow's date?", output)
         self.assertNotIn("sk-from-cursor", output)
 
@@ -710,7 +726,7 @@ class ProxyEndToEndTests(unittest.TestCase):
         self.assertEqual(FakeDeepSeekHandler.requests, [])
 
     def test_proxy_recovers_uncached_cursor_tool_history(self) -> None:
-        with self.assertLogs("deepseek_cursor_proxy", level="WARNING") as captured:
+        with self.assertLogs("deepseek_cursor_proxy", level="INFO") as captured:
             status, payload = post_json(
                 f"{self.proxy.url}/v1/chat/completions",
                 third_cursor_request_missing_all_reasoning(),
@@ -738,8 +754,11 @@ class ProxyEndToEndTests(unittest.TestCase):
             {"role": "user", "content": "Thanks, now continue."},
         )
         self.assertIn(
-            "refreshed reasoning_content history",
+            "status=recovered",
             "\n".join(captured.output),
+        )
+        self.assertFalse(
+            any(record.startswith("WARNING:") for record in captured.output)
         )
 
     def test_trace_captures_recovery_diagnostics(self) -> None:
