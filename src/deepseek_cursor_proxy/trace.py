@@ -105,7 +105,10 @@ def message_summaries(payload: dict[str, Any]) -> list[dict[str, Any]]:
                 len(reasoning) if isinstance(reasoning, str) else 0
             ),
             "has_recovery_notice": content.startswith(
-                "[deepseek-cursor-proxy] Recovered"
+                (
+                    "[deepseek-cursor-proxy] Refreshed reasoning_content history.",
+                    "[deepseek-cursor-proxy] Recovered",
+                )
             ),
         }
         summaries.append(summary)
@@ -231,6 +234,12 @@ class TraceRequest:
             "recovered_reasoning_messages": prepared.recovered_reasoning_messages,
             "recovery_dropped_messages": prepared.recovery_dropped_messages,
             "recovery_notice": prepared.recovery_notice,
+            "record_response_scope": prepared.record_response_scope,
+            "record_response_scopes": [
+                scope for scope, _messages in prepared.record_response_contexts
+            ],
+            "continued_recovery_boundary": prepared.continued_recovery_boundary,
+            "retired_prefix_messages": prepared.retired_prefix_messages,
             "reasoning_diagnostics": prepared.reasoning_diagnostics,
             "recovery_steps": prepared.recovery_steps,
             "upstream_request_summary": payload_summary(prepared.payload),

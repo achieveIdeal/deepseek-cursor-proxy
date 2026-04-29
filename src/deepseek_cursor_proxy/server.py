@@ -160,16 +160,7 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
             )
         if prepared.recovered_reasoning_messages:
             if prepared.recovery_notice:
-                LOG.warning(
-                    (
-                        "recovered request because cached reasoning_content was "
-                        "unavailable for %s assistant message(s); omitted %s "
-                        "older message(s) from forwarded history and will show "
-                        "a Cursor notice"
-                    ),
-                    prepared.recovered_reasoning_messages,
-                    prepared.recovery_dropped_messages,
-                )
+                LOG.warning("refreshed reasoning_content history")
             else:
                 LOG.info(
                     (
@@ -305,7 +296,10 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                     prepared.payload["messages"],
                     prepared.cache_namespace,
                     prepared.recovery_notice,
-                    trace,
+                    trace=trace,
+                    record_response_scope=prepared.record_response_scope,
+                    record_response_messages=prepared.record_response_messages,
+                    record_response_contexts=prepared.record_response_contexts,
                 )
             else:
                 sent_response = self._proxy_regular_response(
@@ -314,7 +308,10 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                     prepared.payload["messages"],
                     prepared.cache_namespace,
                     prepared.recovery_notice,
-                    trace,
+                    trace=trace,
+                    record_response_scope=prepared.record_response_scope,
+                    record_response_messages=prepared.record_response_messages,
+                    record_response_contexts=prepared.record_response_contexts,
                 )
             if not sent_response:
                 self._finish_trace(
@@ -549,6 +546,9 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
         cache_namespace: str,
         recovery_notice: str | None = None,
         trace: TraceRequest | None = None,
+        record_response_scope: str | None = None,
+        record_response_messages: list[dict[str, Any]] | None = None,
+        record_response_contexts: list[tuple[str, list[dict[str, Any]]]] | None = None,
     ) -> bool:
         body = read_response_body(response)
         upstream_body = body
@@ -560,6 +560,9 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                 request_messages,
                 cache_namespace,
                 content_prefix=recovery_notice,
+                scope=record_response_scope,
+                prior_messages=record_response_messages,
+                recording_contexts=record_response_contexts,
             )
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
             LOG.warning("failed to rewrite upstream JSON response: %s", exc)
@@ -611,6 +614,9 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
         cache_namespace: str,
         recovery_notice: str | None = None,
         trace: TraceRequest | None = None,
+        record_response_scope: str | None = None,
+        record_response_messages: list[dict[str, Any]] | None = None,
+        record_response_contexts: list[tuple[str, list[dict[str, Any]]]] | None = None,
     ) -> bool:
         if trace is not None:
             trace.record_upstream_response(
@@ -645,7 +651,21 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
             if self.config.cursor_display_reasoning
             else None
         )
-        scope = conversation_scope(request_messages, cache_namespace)
+        scope = (
+            record_response_scope
+            if record_response_scope is not None
+            else conversation_scope(request_messages, cache_namespace)
+        )
+        response_prior_messages = (
+            record_response_messages
+            if record_response_messages is not None
+            else request_messages
+        )
+        response_contexts = (
+            record_response_contexts
+            if record_response_contexts is not None
+            else [(scope, response_prior_messages)]
+        )
         finalized = False
         pending_recovery_notice = recovery_notice
         while True:
@@ -660,7 +680,8 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                 line,
                 original_model,
                 accumulator,
-                scope,
+                cache_namespace,
+                response_contexts,
                 display_adapter,
                 pending_recovery_notice,
                 trace,
@@ -677,7 +698,15 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
         if not finalized:
             if self.config.verbose:
                 log_json("model streaming assistant messages", accumulator.messages())
-            stored = accumulator.store_reasoning(self.reasoning_store, scope)
+            stored = sum(
+                accumulator.store_reasoning(
+                    self.reasoning_store,
+                    scope,
+                    cache_namespace,
+                    prior_messages,
+                )
+                for scope, prior_messages in response_contexts
+            )
             if stored:
                 LOG.info("stored %s streaming reasoning cache key(s)", stored)
         return True
@@ -687,7 +716,8 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
         line: bytes,
         original_model: str,
         accumulator: StreamAccumulator,
-        scope: str,
+        cache_namespace: str,
+        response_contexts: list[tuple[str, list[dict[str, Any]]]],
         display_adapter: CursorReasoningDisplayAdapter | None,
         recovery_notice: str | None = None,
         trace: TraceRequest | None = None,
@@ -700,7 +730,15 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
         if data == b"[DONE]":
             if self.config.verbose:
                 log_json("model streaming assistant messages", accumulator.messages())
-            stored = accumulator.store_reasoning(self.reasoning_store, scope)
+            stored = sum(
+                accumulator.store_reasoning(
+                    self.reasoning_store,
+                    scope,
+                    cache_namespace,
+                    prior_messages,
+                )
+                for scope, prior_messages in response_contexts
+            )
             if stored:
                 LOG.info("stored %s streaming reasoning cache key(s)", stored)
             prefix = b""
@@ -728,7 +766,15 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
             if recovery_notice and inject_recovery_notice(chunk, recovery_notice):
                 recovery_notice = None
             accumulator.ingest_chunk(chunk)
-            stored = accumulator.store_ready_reasoning(self.reasoning_store, scope)
+            stored = sum(
+                accumulator.store_ready_reasoning(
+                    self.reasoning_store,
+                    scope,
+                    cache_namespace,
+                    prior_messages,
+                )
+                for scope, prior_messages in response_contexts
+            )
             if stored:
                 LOG.info("stored %s streaming reasoning cache key(s)", stored)
             if trace is not None:
