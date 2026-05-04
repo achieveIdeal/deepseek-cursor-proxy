@@ -14,7 +14,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 import gzip
 import json
+import logging
 from pathlib import Path
+import re
 import threading
 import time
 from types import SimpleNamespace
@@ -24,6 +26,10 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from deepseek_cursor_proxy.config import ProxyConfig
+from deepseek_cursor_proxy.logging import (
+    ConsoleLogFormatter,
+    TerminalSpinner,
+)
 from deepseek_cursor_proxy.reasoning_store import ReasoningStore
 from deepseek_cursor_proxy.server import (
     DeepSeekProxyHandler,
@@ -80,6 +86,21 @@ class _BrokenPipeWfile:
         raise BrokenPipeError("test disconnect")
 
 
+class _FakeConsole:
+    def __init__(self, *, tty: bool) -> None:
+        self.tty = tty
+        self.writes: list[str] = []
+
+    def isatty(self) -> bool:
+        return self.tty
+
+    def write(self, text: str) -> None:
+        self.writes.append(text)
+
+    def flush(self) -> None:
+        return
+
+
 def _make_handler_stub(wfile: object, **config: object) -> DeepSeekProxyHandler:
     handler = object.__new__(DeepSeekProxyHandler)
     handler.server = SimpleNamespace(
@@ -118,6 +139,76 @@ class CliAndHelperTests(unittest.TestCase):
         self.assertFalse(args.collapsible_reasoning)
         self.assertTrue(args.cors)
         self.assertEqual(args.trace_dir, Path("/tmp/dcp-traces"))
+
+    def test_default_console_logging_hides_info_prefix_and_timestamp(self) -> None:
+        formatter = ConsoleLogFormatter(verbose=False)
+        info_record = logging.LogRecord(
+            "deepseek_cursor_proxy",
+            logging.INFO,
+            __file__,
+            1,
+            "listening on %s",
+            ("http://127.0.0.1:9000/v1",),
+            None,
+        )
+        warning_record = logging.LogRecord(
+            "deepseek_cursor_proxy",
+            logging.WARNING,
+            __file__,
+            1,
+            "trace logging enabled",
+            (),
+            None,
+        )
+
+        self.assertEqual(
+            formatter.format(info_record),
+            "listening on http://127.0.0.1:9000/v1",
+        )
+        self.assertEqual(
+            formatter.format(warning_record), "WARNING trace logging enabled"
+        )
+
+    def test_verbose_console_logging_shows_timestamp_and_level(self) -> None:
+        formatter = ConsoleLogFormatter(verbose=True)
+        record = logging.LogRecord(
+            "deepseek_cursor_proxy",
+            logging.INFO,
+            __file__,
+            1,
+            "listening on %s",
+            ("http://127.0.0.1:9000/v1",),
+            None,
+        )
+
+        self.assertRegex(
+            formatter.format(record),
+            re.compile(
+                r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3} INFO listening on "
+            ),
+        )
+
+    def test_terminal_spinner_animates_only_for_tty(self) -> None:
+        tty = _FakeConsole(tty=True)
+        spinner = TerminalSpinner(
+            enabled=True, text="└ {frame}", stream=tty, interval=0.001
+        ).start()
+        deadline = time.monotonic() + 0.2
+        while time.monotonic() < deadline and not tty.writes:
+            time.sleep(0.001)
+        spinner.stop()
+
+        output = "".join(tty.writes)
+        self.assertIn(TerminalSpinner.hide_cursor, output)
+        self.assertIn("└ ⠋", output)
+        self.assertIn(TerminalSpinner.show_cursor, output)
+        self.assertTrue(output.endswith(TerminalSpinner.show_cursor))
+
+        non_tty = _FakeConsole(tty=False)
+        TerminalSpinner(
+            enabled=True, text="└ {frame}", stream=non_tty, interval=0.001
+        ).start().stop()
+        self.assertEqual(non_tty.writes, [])
 
     def test_read_response_body_decodes_gzip_and_deflate(self) -> None:
         self.assertEqual(
@@ -461,10 +552,12 @@ class HttpBoundaryTests(unittest.TestCase):
                 time.sleep(0.01)
         output = "\n".join(captured.output)
         self.assertEqual(status, 200)
-        # Single-line stage records keep the log readable.
-        for marker in ("┌ cursor", "├ context", "├ send", "└ stats"):
-            self.assertIn(marker, output)
-        self.assertNotIn("hi", output.split("┌ cursor")[1].split("\n")[0])
+        self.assertIn("┌ request model=deepseek-v4-pro effort=max messages=1", output)
+        self.assertIn("├ context status=ok reasoning_context=0", output)
+        self.assertIn("└ stats", output)
+        self.assertNotIn(" tools=", output)
+        self.assertNotIn("├ send", output)
+        self.assertNotIn("hi", output.split("┌ request")[1].split("\n")[0])
         self.assertNotIn("sk-from-cursor", output)
 
     def test_verbose_logging_includes_bodies_but_redacts_api_key(self) -> None:

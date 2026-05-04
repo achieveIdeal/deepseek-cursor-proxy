@@ -5,7 +5,6 @@ from dataclasses import dataclass, replace
 import gzip
 from http.client import HTTPException
 import json
-import logging
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import sys
@@ -21,19 +20,20 @@ from .config import (
     default_config_path,
     default_reasoning_content_path,
 )
+from .logging import (
+    LOG,
+    TerminalSpinner,
+    configure_logging,
+)
 from .reasoning_store import ReasoningStore, conversation_scope
 from .streaming import CursorReasoningDisplayAdapter, StreamAccumulator
 from .trace import TraceRequest, TraceWriter
 from .tunnel import NgrokTunnel, local_tunnel_target
 from .transform import (
-    PreparedRequest,
     RECOVERY_NOTICE_CONTENT,
     prepare_upstream_request,
     rewrite_response_body,
 )
-
-
-LOG = logging.getLogger("deepseek_cursor_proxy")
 
 
 class RequestBodyTooLarge(ValueError):
@@ -237,13 +237,19 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
             headers=upstream_headers,
         )
 
-        log_send_summary(prepared)
+        if self.config.verbose:
+            log_send_summary(prepared)
+        spinner = TerminalSpinner(
+            enabled=bool(prepared.payload.get("stream")) and not self.config.verbose,
+            text="└ {frame}",
+        ).start()
 
         try:
             if self.config.verbose:
                 LOG.info("forwarding to %s", upstream_url)
             response = urlopen(request, timeout=self.config.request_timeout)
         except HTTPError as exc:
+            spinner.stop()
             LOG.warning(
                 "request failed upstream_status=%s stream=%s elapsed_ms=%s",
                 exc.code,
@@ -259,6 +265,7 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
             )
             return
         except URLError as exc:
+            spinner.stop()
             LOG.warning(
                 "upstream request failed elapsed_ms=%s reason=%s",
                 elapsed_ms(started),
@@ -271,55 +278,63 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
             )
             self._finish_trace(trace, "upstream_error", http_status=502)
             return
+        except Exception:
+            spinner.stop()
+            raise
 
-        with response:
-            upstream_status = getattr(response, "status", 200)
-            if self.config.verbose:
-                LOG.info(
-                    "upstream response status=%s stream=%s elapsed_ms=%s",
-                    upstream_status,
-                    bool(prepared.payload.get("stream")),
-                    elapsed_ms(started),
-                )
-            if prepared.payload.get("stream"):
-                sent_response = self._proxy_streaming_response(
-                    response,
-                    prepared.original_model,
-                    prepared.payload["messages"],
-                    prepared.cache_namespace,
-                    prepared.recovery_notice,
-                    trace=trace,
-                    record_response_scope=prepared.record_response_scope,
-                    record_response_messages=prepared.record_response_messages,
-                    record_response_contexts=prepared.record_response_contexts,
-                )
-            else:
-                sent_response = self._proxy_regular_response(
-                    response,
-                    prepared.original_model,
-                    prepared.payload["messages"],
-                    prepared.cache_namespace,
-                    prepared.recovery_notice,
-                    trace=trace,
-                    record_response_scope=prepared.record_response_scope,
-                    record_response_messages=prepared.record_response_messages,
-                    record_response_contexts=prepared.record_response_contexts,
-                )
-            if not sent_response.sent:
+        try:
+            with response:
+                upstream_status = getattr(response, "status", 200)
+                if self.config.verbose:
+                    LOG.info(
+                        "upstream response status=%s stream=%s elapsed_ms=%s",
+                        upstream_status,
+                        bool(prepared.payload.get("stream")),
+                        elapsed_ms(started),
+                    )
+                if prepared.payload.get("stream"):
+                    sent_response = self._proxy_streaming_response(
+                        response,
+                        prepared.original_model,
+                        prepared.payload["messages"],
+                        prepared.cache_namespace,
+                        prepared.recovery_notice,
+                        trace=trace,
+                        record_response_scope=prepared.record_response_scope,
+                        record_response_messages=prepared.record_response_messages,
+                        record_response_contexts=prepared.record_response_contexts,
+                    )
+                else:
+                    sent_response = self._proxy_regular_response(
+                        response,
+                        prepared.original_model,
+                        prepared.payload["messages"],
+                        prepared.cache_namespace,
+                        prepared.recovery_notice,
+                        trace=trace,
+                        record_response_scope=prepared.record_response_scope,
+                        record_response_messages=prepared.record_response_messages,
+                        record_response_contexts=prepared.record_response_contexts,
+                    )
+                if not sent_response.sent:
+                    spinner.stop()
+                    self._finish_trace(
+                        trace,
+                        "client_disconnected",
+                        http_status=upstream_status,
+                        stream=bool(prepared.payload.get("stream")),
+                    )
+                    return
+                spinner.stop()
+                log_stats_summary(sent_response.usage)
                 self._finish_trace(
                     trace,
-                    "client_disconnected",
+                    "completed",
                     http_status=upstream_status,
                     stream=bool(prepared.payload.get("stream")),
                 )
-                return
-            log_stats_summary(sent_response.usage)
-            self._finish_trace(
-                trace,
-                "completed",
-                http_status=upstream_status,
-                stream=bool(prepared.payload.get("stream")),
-            )
+        finally:
+            spinner.stop()
 
     def _start_trace(self, request_path: str) -> TraceRequest | None:
         writer = self.trace_writer
@@ -997,26 +1012,31 @@ def log_cursor_request(
 ) -> None:
     model = str(payload.get("model") or config.upstream_model)
     LOG.info(
-        "┌ cursor  model=%s effort=%s messages=%s tools=%s",
+        "┌ request model=%s effort=%s messages=%s",
         model,
         config.reasoning_effort,
         format_count(message_count(payload)),
-        format_count(tool_count(payload)),
     )
 
 
-def log_context_summary(prepared: PreparedRequest) -> None:
+def log_context_summary(prepared: Any) -> None:
+    status = context_status(prepared)
+    if status == "ok":
+        LOG.info(
+            "├ context status=ok reasoning_context=%s",
+            format_count(prepared.patched_reasoning_messages),
+        )
+        return
     LOG.info(
-        "├ context filled=%s missing=%s recovered=%s dropped=%s status=%s",
-        format_count(prepared.patched_reasoning_messages),
+        "├ context status=%s missing=%s recovered=%s dropped=%s",
+        status,
         format_count(prepared.missing_reasoning_messages),
         format_count(prepared.recovered_reasoning_messages),
         format_count(prepared.recovery_dropped_messages),
-        context_status(prepared),
     )
 
 
-def log_send_summary(prepared: PreparedRequest) -> None:
+def log_send_summary(prepared: Any) -> None:
     LOG.info(
         "├ send    user_msgs=%s messages=%s tools=%s reasoning_content=%s",
         format_count(user_message_count(prepared.payload)),
@@ -1036,7 +1056,7 @@ def log_stats_summary(usage: dict[str, Any] | None) -> None:
     )
 
 
-def context_status(prepared: PreparedRequest) -> str:
+def context_status(prepared: Any) -> str:
     if prepared.recovered_reasoning_messages:
         return "recovered"
     if prepared.missing_reasoning_messages:
@@ -1216,13 +1236,11 @@ def warn_if_insecure_upstream(url: str) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    logging.basicConfig(
-        level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s"
-    )
     args = build_arg_parser().parse_args(argv)
     try:
         config = ProxyConfig.from_file(config_path=args.config_path)
     except ValueError as exc:
+        configure_logging(verbose=bool(args.verbose))
         LOG.error("%s", exc)
         return 2
     updates: dict[str, Any] = {}
@@ -1267,6 +1285,7 @@ def main(argv: list[str] | None = None) -> int:
     if updates:
         config = replace(config, **updates)
 
+    configure_logging(verbose=config.verbose)
     warn_if_insecure_upstream(config.upstream_base_url)
     store = ReasoningStore(
         config.reasoning_content_path,
@@ -1291,37 +1310,8 @@ def main(argv: list[str] | None = None) -> int:
     server.reasoning_store = store
     server.trace_writer = trace_writer
 
-    LOG.info("listening on http://%s:%s/v1", config.host, config.port)
-    LOG.info(
-        "forwarding to %s/chat/completions default_model=%s",
-        config.upstream_base_url,
-        config.upstream_model,
-    )
-    LOG.info(
-        (
-            "thinking=%s reasoning_effort=%s display_reasoning=%s "
-            "collapsible_reasoning=%s missing_reasoning_strategy=%s "
-            "reasoning_content_path=%s"
-        ),
-        config.thinking,
-        config.reasoning_effort,
-        config.display_reasoning,
-        config.collapsible_reasoning,
-        config.missing_reasoning_strategy,
-        config.reasoning_content_path,
-    )
-    if config.verbose:
-        LOG.info("logging mode=verbose metadata=detailed bodies=true")
-        LOG.warning(
-            "verbose logging enabled; prompts and code may be written to stdout"
-        )
-    else:
-        LOG.info("logging mode=normal metadata=safe_summaries bodies=false")
-    if trace_writer is not None:
-        LOG.info("trace session directory: %s", trace_writer.session_dir)
-        LOG.warning("trace logging enabled; prompts and code will be written to disk")
-
     tunnel: NgrokTunnel | None = None
+    public_url: str | None = None
     if config.ngrok:
         target_url = local_tunnel_target(config.host, config.port)
         tunnel = NgrokTunnel(target_url)
@@ -1332,8 +1322,39 @@ def main(argv: list[str] | None = None) -> int:
             server.server_close()
             store.close()
             return 2
-        LOG.info("ngrok tunnel forwarding %s -> %s", public_url, target_url)
-        LOG.info("api base url: %s/v1", public_url.rstrip("/"))
+    local_base_url = f"http://{config.host}:{config.port}/v1"
+    api_base_url = (
+        f"{public_url.rstrip('/')}/v1" if public_url is not None else local_base_url
+    )
+
+    LOG.info(
+        "default_model: %s (%s, %s)",
+        config.upstream_model,
+        "thinking" if config.thinking == "enabled" else "no thinking",
+        config.reasoning_effort,
+    )
+
+    if config.verbose:
+        display_reasoning = "off"
+        if config.display_reasoning:
+            display_reasoning = (
+                "on (collapsible)" if config.collapsible_reasoning else "on"
+            )
+        LOG.info("display_reasoning: %s", display_reasoning)
+        LOG.info("missing_reasoning_strategy: %s", config.missing_reasoning_strategy)
+        LOG.info("reasoning_cache: %s", config.reasoning_content_path)
+        LOG.warning(
+            "verbose logging enabled; prompts and code may be written to stdout"
+        )
+    if trace_writer is not None:
+        LOG.info("trace_dir: %s", trace_writer.session_dir)
+        LOG.warning("trace logging enabled; prompts and code will be written to disk")
+    if public_url is None and not config.ngrok:
+        LOG.info("public_tunnel: off")
+    if config.verbose:
+        LOG.info("upstream_url: %s/chat/completions", config.upstream_base_url)
+    LOG.info("local_base_url: %s", local_base_url)
+    LOG.info("api_base_url: %s", api_base_url)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
