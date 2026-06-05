@@ -274,7 +274,7 @@ class HandlerStubTests(unittest.TestCase):
         finally:
             handler.server.reasoning_store.close()
         self.assertFalse(result.sent)
-        self.assertIn("sending upstream response body", "\n".join(captured.output))
+        self.assertIn("发送上游响应体", "\n".join(captured.output))
 
     def test_streaming_response_stops_on_client_disconnect(self) -> None:
         handler = _make_handler_stub(_BrokenPipeWfile())
@@ -301,7 +301,7 @@ class HandlerStubTests(unittest.TestCase):
             handler.server.reasoning_store.close()
         self.assertFalse(result.sent)
         self.assertEqual(response.readline_calls, 1)
-        self.assertIn("sending streaming response chunk", "\n".join(captured.output))
+        self.assertIn("发送流式响应块", "\n".join(captured.output))
 
     def test_streaming_response_handles_upstream_read_failure(self) -> None:
         handler = _make_handler_stub(BytesIO())
@@ -317,7 +317,7 @@ class HandlerStubTests(unittest.TestCase):
             handler.server.reasoning_store.close()
         self.assertFalse(result.sent)
         self.assertIn(
-            "upstream streaming response read failed", "\n".join(captured.output)
+            "读取上游流式响应失败", "\n".join(captured.output)
         )
 
     def test_collapsible_reasoning_no_effect_when_display_disabled(self) -> None:
@@ -503,7 +503,7 @@ class HttpBoundaryTests(unittest.TestCase):
             f"{self.proxy.url}/v1/chat/completions", self._request()
         )
         self.assertEqual(status, 413)
-        self.assertIn("too large", payload["error"]["message"])
+        self.assertIn("过大", payload["error"]["message"])
         self.assertEqual(_PlainFakeUpstream.requests, [])
 
     def test_forwards_bearer_token_to_upstream(self) -> None:
@@ -558,12 +558,12 @@ class HttpBoundaryTests(unittest.TestCase):
                 time.sleep(0.01)
         output = "\n".join(captured.output)
         self.assertEqual(status, 200)
-        self.assertIn("┌ request model=deepseek-v4-pro effort=max messages=1", output)
-        self.assertIn("├ context status=ok reasoning_context=0", output)
-        self.assertIn("└ stats", output)
+        self.assertIn("┌ 请求 model=deepseek-v4-pro effort=max messages=1", output)
+        self.assertIn("├ 上下文 status=ok reasoning_context=0", output)
+        self.assertIn("└ 统计", output)
         self.assertNotIn(" tools=", output)
         self.assertNotIn("├ send", output)
-        self.assertNotIn("hi", output.split("┌ request")[1].split("\n")[0])
+        self.assertNotIn("hi", output.split("┌ 请求")[1].split("\n")[0])
         self.assertNotIn("sk-from-cursor", output)
 
     def test_verbose_logging_includes_bodies_but_redacts_api_key(self) -> None:
@@ -575,8 +575,8 @@ class HttpBoundaryTests(unittest.TestCase):
                 api_key="sk-from-cursor",
             )
         output = "\n".join(captured.output)
-        self.assertIn("cursor request body", output)
-        self.assertIn("upstream request body", output)
+        self.assertIn("Cursor 请求体", output)
+        self.assertIn("上游请求体", output)
         self.assertNotIn("sk-from-cursor", output)
 
     def test_healthz_returns_ok(self) -> None:

@@ -67,8 +67,8 @@ class NgrokTunnel:
     def start(self) -> str:
         if shutil.which(self.command) is None:
             raise RuntimeError(
-                "ngrok is not installed or is not on PATH. Install it, then run "
-                "`ngrok config add-authtoken <token>` once."
+                "未安装 ngrok 或不在 PATH 中。请先安装，然后运行一次 "
+                "`ngrok config add-authtoken <token>`。"
             )
 
         argv = [self.command, "http", self.target_url]
@@ -88,10 +88,10 @@ class NgrokTunnel:
 
     def wait_for_public_url(self) -> str:
         deadline = time.monotonic() + self.startup_timeout
-        last_error = "ngrok did not report a public URL"
+        last_error = "ngrok 未报告公网 URL"
         while time.monotonic() < deadline:
             if self.process is not None and self.process.poll() is not None:
-                raise RuntimeError("ngrok exited before creating a tunnel")
+                raise RuntimeError("ngrok 在创建隧道前已退出")
             for api_url in ngrok_agent_urls(self.api_url):
                 try:
                     with urlopen(api_url, timeout=1) as response:
@@ -102,12 +102,12 @@ class NgrokTunnel:
                 except (OSError, URLError, json.JSONDecodeError) as exc:
                     last_error = str(exc)
             time.sleep(0.25)
-        raise RuntimeError(f"Timed out waiting for ngrok tunnel: {last_error}")
+        raise RuntimeError(f"等待 ngrok 隧道超时: {last_error}")
 
     def stop(self) -> None:
         if self.process is None or self.process.poll() is not None:
             return
-        LOG.info("stopping ngrok tunnel")
+        LOG.info("正在停止 ngrok 隧道")
         self.process.terminate()
         try:
             self.process.wait(timeout=5)

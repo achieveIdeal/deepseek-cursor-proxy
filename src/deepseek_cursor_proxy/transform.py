@@ -5,6 +5,8 @@ import hashlib
 import json
 import re
 from typing import Any
+import urllib.request
+from urllib.error import HTTPError, URLError
 
 from .config import ProxyConfig
 from .logging import LOG
@@ -38,9 +40,8 @@ SUPPORTED_REQUEST_FIELDS = {
     "frequency_penalty",
     "logprobs",
     "top_logprobs",
-    # Standard OpenAI Chat Completions fields that DeepSeek either honors or
-    # safely ignores. Cursor and most OpenAI SDKs send these unconditionally,
-    # so forwarding keeps clients happy and avoids log spam.
+    # DeepSeek 会遵守或安全忽略的标准 OpenAI Chat Completions 字段。
+    # Cursor 和大多数 OpenAI SDK 会无条件发送这些字段，转发可保持客户端兼容并减少日志噪音。
     "user",
     "seed",
     "n",
@@ -92,14 +93,147 @@ CURSOR_THINKING_BLOCK_RE = re.compile(
     re.IGNORECASE | re.VERBOSE,
 )
 
-RECOVERY_NOTICE_TEXT = "[deepseek-cursor-proxy] Refreshed reasoning_content history."
+RECOVERY_NOTICE_TEXT = "[deepseek-cursor-proxy] 已刷新 reasoning_content 历史记录。"
 RECOVERY_NOTICE_CONTENT = f"{RECOVERY_NOTICE_TEXT}\n\n"
 RECOVERY_SYSTEM_CONTENT = (
-    "deepseek-cursor-proxy recovered this request because older DeepSeek "
-    "thinking-mode tool-call reasoning_content was unavailable. Older "
-    "unrecoverable tool-call history was omitted; continue using only the "
-    "remaining recovered context."
+    "deepseek-cursor-proxy 已恢复此请求，因为较早的 DeepSeek 思考模式工具调用 "
+    "reasoning_content 不可用。已省略无法恢复的较早工具调用历史；请仅使用剩余已恢复的上下文继续。"
 )
+
+SUMMARY_SYSTEM_PREFIX = (
+    "[deepseek-cursor-proxy] 对话摘要（已保留先前上下文）：\n\n"
+)
+
+RESPONSE_LANGUAGE_INSTRUCTIONS = {
+    "zh": (
+        "请始终使用中文进行思考和回答。"
+        "你的 reasoning_content（思考过程）和最终回复内容都必须使用中文。"
+    ),
+    "en": (
+        "Always think and respond in English. "
+        "Both your reasoning_content and final reply must be in English."
+    ),
+}
+
+
+def _format_messages_for_summary(messages: list[dict[str, Any]]) -> str:
+    lines: list[str] = []
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role", "unknown")
+        content = extract_text_content(msg.get("content")) or ""
+        if role == "system":
+            lines.append(f"[系统]: {content}")
+        elif role == "user":
+            lines.append(f"[用户]: {content}")
+        elif role == "assistant":
+            tool_calls = msg.get("tool_calls")
+            if isinstance(tool_calls, list) and tool_calls:
+                tc_desc = ", ".join(
+                    str((tc.get("function") or {}).get("name", "?"))
+                    for tc in tool_calls
+                    if isinstance(tc, dict)
+                )
+                lines.append(f"[助手 — 调用了 {tc_desc}]: {content}")
+            else:
+                lines.append(f"[助手]: {content}")
+        elif role == "tool":
+            tool_id = msg.get("tool_call_id", "?")
+            truncated = content[:500] + "..." if len(content) > 500 else content
+            lines.append(f"[工具 {tool_id} 的结果]: {truncated}")
+    return "\n\n".join(lines)
+
+
+def summarize_conversation(
+    messages_to_summarize: list[dict[str, Any]],
+    config: ProxyConfig,
+    authorization: str,
+    upstream_model: str,
+) -> str | None:
+    if not messages_to_summarize:
+        return None
+
+    formatted = _format_messages_for_summary(messages_to_summarize)
+    summary_payload = {
+        "model": upstream_model,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "你是对话摘要助手。请对以下对话历史生成全面但简洁的摘要。"
+                    "保留所有关键信息：已做决策、编写或修改的代码、发现的错误及修复、"
+                    "技术上下文、用户偏好以及进行中的任务。摘要必须包含足够细节，"
+                    "以便在不丢失上下文的情况下继续对话。"
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    "请摘要以下对话。"
+                    f"务必全面但简洁：\n\n{formatted}"
+                ),
+            },
+        ],
+        "stream": False,
+        "max_tokens": 2000,
+        "thinking": {"type": "disabled"},
+    }
+
+    upstream_url = f"{config.upstream_base_url}/chat/completions"
+    body = json.dumps(
+        summary_payload, ensure_ascii=False, separators=(",", ":")
+    ).encode("utf-8")
+
+    request = urllib.request.Request(
+        upstream_url,
+        data=body,
+        method="POST",
+        headers={
+            "Authorization": authorization,
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=config.request_timeout) as resp:
+            response_body = resp.read()
+            result = json.loads(response_body.decode("utf-8"))
+            choices = result.get("choices", [])
+            if choices and isinstance(choices[0], dict):
+                message = choices[0].get("message", {})
+                summary = message.get("content", "")
+                if summary:
+                    LOG.info(
+                        "已将 %s 条消息摘要为 %s 个字符",
+                        len(messages_to_summarize),
+                        len(summary),
+                    )
+                    return summary.strip()
+    except (HTTPError, URLError, OSError, json.JSONDecodeError) as exc:
+        LOG.warning("对话摘要失败: %s", exc)
+
+    return None
+
+
+def rebuild_messages_with_summary(
+    messages: list[dict[str, Any]],
+    summary: str,
+    keep_recent: int,
+) -> list[dict[str, Any]]:
+    system_msgs = leading_system_messages(messages)
+    non_system_msgs = messages[len(system_msgs):]
+
+    split_index = max(0, len(non_system_msgs) - keep_recent)
+    recent_msgs = non_system_msgs[split_index:]
+
+    summary_msg = {
+        "role": "system",
+        "content": SUMMARY_SYSTEM_PREFIX + summary,
+    }
+
+    return [*system_msgs, summary_msg, *recent_msgs]
 
 
 @dataclass(frozen=True)
@@ -149,7 +283,7 @@ def extract_text_content(content: Any) -> str | None:
             elif isinstance(text, str):
                 parts.append(text)
             elif item_type:
-                parts.append(f"[{item_type} omitted by DeepSeek text proxy]")
+                parts.append(f"[{item_type} 已由 DeepSeek 文本代理省略]")
         return "\n".join(part for part in parts if part)
     if isinstance(content, (dict, tuple)):
         return json.dumps(content, ensure_ascii=False, sort_keys=True)
@@ -497,11 +631,10 @@ def has_recovery_notice(message: dict[str, Any]) -> bool:
 def strip_recovery_notice_for_upstream(
     messages: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Cursor echoes the proxy's recovery notice back to us in later turns.
-    The notice serves as a boundary marker for the proxy, but DeepSeek must
-    not see proxy-generated prose. Return a copy with assistant prefixes
-    stripped; leave the input untouched so cache scopes/recording contexts
-    keep matching the with-prefix history that Cursor will send next time."""
+    """Cursor 在后续轮次会将代理的恢复通知回传给我们。
+    该通知作为代理的边界标记，但 DeepSeek 不应看到代理生成的文本。
+    返回剥离了助手消息前缀的副本；保持输入不变，以便缓存作用域/记录上下文
+    继续匹配 Cursor 下次将发送的带前缀历史。"""
     stripped: list[dict[str, Any]] = []
     for message in messages:
         if message.get("role") != "assistant":
@@ -515,6 +648,21 @@ def strip_recovery_notice_for_upstream(
         cleaned["content"] = content[len(RECOVERY_NOTICE_TEXT) :].lstrip("\r\n")
         stripped.append(cleaned)
     return stripped
+
+
+def inject_response_language_instruction(
+    messages: list[dict[str, Any]],
+    language: str | None,
+) -> list[dict[str, Any]]:
+    if not language or language not in RESPONSE_LANGUAGE_INSTRUCTIONS:
+        return messages
+    instruction = RESPONSE_LANGUAGE_INSTRUCTIONS[language]
+    leading = leading_system_messages(messages)
+    for message in leading:
+        if message.get("content") == instruction:
+            return messages
+    rest = messages[len(leading):]
+    return [*leading, {"role": "system", "content": instruction}, *rest]
 
 
 def leading_system_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -682,7 +830,7 @@ def upstream_model_for(original_model: str, config: ProxyConfig) -> str:
     if original_model.startswith("deepseek-"):
         return original_model
     LOG.warning(
-        "rewriting non-DeepSeek model %r to configured fallback %r",
+        "正在将非 DeepSeek 模型 %r 重写为配置的回退模型 %r",
         original_model,
         config.upstream_model,
     )
@@ -754,7 +902,7 @@ def prepare_upstream_request(
     )
     if dropped_fields:
         LOG.warning(
-            "dropping unsupported request field(s): %s", ", ".join(dropped_fields)
+            "正在丢弃不支持的请求字段: %s", ", ".join(dropped_fields)
         )
     if "max_tokens" not in prepared and "max_completion_tokens" in payload:
         prepared["max_tokens"] = payload["max_completion_tokens"]
@@ -802,6 +950,41 @@ def prepare_upstream_request(
         prepared.get("reasoning_effort"),
         authorization,
     )
+
+    raw_messages = payload.get("messages")
+    if (
+        config.summary_enabled
+        and isinstance(raw_messages, list)
+        and len(raw_messages) > config.summary_max_messages
+        and authorization
+    ):
+        keep_recent = max(1, config.summary_keep_recent)
+        messages_to_summarize = raw_messages[: -keep_recent] if keep_recent < len(raw_messages) else raw_messages
+        summary = summarize_conversation(
+            messages_to_summarize,
+            config,
+            authorization,
+            upstream_model,
+        )
+        if summary:
+            if store is not None:
+                cleared = store.clear_namespace(cache_namespace)
+                if cleared:
+                    LOG.info(
+                        "已清除命名空间 %s 的 %s 条 reasoning 缓存条目",
+                        cache_namespace[:12],
+                        cleared,
+                    )
+            payload["messages"] = rebuild_messages_with_summary(
+                raw_messages, summary, keep_recent,
+            )
+            LOG.info(
+                "已重建对话: %s 条消息 -> %s 条消息（摘要 %s 个字符）",
+                len(raw_messages),
+                len(payload["messages"]),
+                len(summary),
+            )
+
     pre_repair_messages, _, _, _ = normalize_messages(
         payload.get("messages"),
         None,
@@ -864,6 +1047,10 @@ def prepare_upstream_request(
     record_response_contexts = response_recording_contexts(
         (record_response_scope, record_response_messages),
         (active_record_response_scope, messages),
+    )
+    messages = inject_response_language_instruction(
+        messages,
+        config.response_language,
     )
     prepared["messages"] = strip_recovery_notice_for_upstream(messages)
 

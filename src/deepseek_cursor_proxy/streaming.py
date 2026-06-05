@@ -9,7 +9,7 @@ from .reasoning_store import ReasoningStore
 
 THINKING_BLOCK_START = "<think>\n"
 THINKING_BLOCK_END = "\n</think>\n\n"
-COLLAPSIBLE_THINKING_BLOCK_START = "<details>\n<summary>Thinking</summary>\n\n"
+COLLAPSIBLE_THINKING_BLOCK_START = "<details>\n<summary>思考</summary>\n\n"
 COLLAPSIBLE_THINKING_BLOCK_END = "\n</details>\n\n"
 
 
@@ -212,7 +212,7 @@ class StreamAccumulator:
 
 
 class CursorReasoningDisplayAdapter:
-    """Mirror reasoning_content into content for Cursor's visible thinking UI path."""
+    """将 reasoning_content 镜像到 content，供 Cursor 可见的思考 UI 路径使用。"""
 
     def __init__(self, collapsible: bool = True) -> None:
         self._open_choices: set[int] = set()
@@ -298,8 +298,8 @@ def fold_reasoning_into_content(
     response_payload: dict[str, Any],
     collapsible: bool,
 ) -> None:
-    """Mirror `reasoning_content` into the visible `content` field for
-    non-streaming responses, matching the streaming `<details>` layout."""
+    """将 `reasoning_content` 镜像到非流式响应的可见 `content` 字段，
+    与流式 `<details>` 布局保持一致。"""
     block_start = (
         COLLAPSIBLE_THINKING_BLOCK_START if collapsible else THINKING_BLOCK_START
     )

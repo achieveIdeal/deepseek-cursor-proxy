@@ -583,7 +583,7 @@ class RecoveryTests(_StrictUpstreamCase):
             sent["messages"][-1]["content"], "Thanks. What about Saturday?"
         )
         self.assertIn(
-            "[deepseek-cursor-proxy] Refreshed reasoning",
+            "[deepseek-cursor-proxy] 已刷新 reasoning",
             response["choices"][0]["message"]["content"],
         )
 
@@ -978,7 +978,7 @@ class StreamingDisplayTests(unittest.TestCase):
         ]
         self.assertEqual(
             chunks[0]["choices"][0]["delta"]["content"],
-            "<details>\n<summary>Thinking</summary>\n\nNeed ",
+            "<details>\n<summary>思考</summary>\n\nNeed ",
         )
         self.assertEqual(
             chunks[2]["choices"][0]["delta"]["content"],
@@ -1007,7 +1007,7 @@ class NonStreamingDisplayTests(_StrictUpstreamCase):
         content = response["choices"][0]["message"]["content"]
         self.assertEqual(
             content,
-            f"<details>\n<summary>Thinking</summary>\n\n{THINKING_1_1}\n</details>\n\n",
+            f"<details>\n<summary>思考</summary>\n\n{THINKING_1_1}\n</details>\n\n",
         )
 
 

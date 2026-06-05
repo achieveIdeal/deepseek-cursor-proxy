@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "deepseek-cursor-proxy"
 version = "0.1.1"
-description = "Local OpenAI-compatible proxy for Cursor and DeepSeek thinking models"
+description = "用于 Cursor 与 DeepSeek 思考模型的本地 OpenAI 兼容代理"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"

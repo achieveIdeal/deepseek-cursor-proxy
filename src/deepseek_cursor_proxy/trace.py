@@ -106,8 +106,8 @@ def message_summaries(payload: dict[str, Any]) -> list[dict[str, Any]]:
             ),
             "has_recovery_notice": content.startswith(
                 (
-                    "[deepseek-cursor-proxy] Refreshed reasoning_content history.",
-                    "[deepseek-cursor-proxy] Recovered",
+                    "[deepseek-cursor-proxy] 已刷新 reasoning_content 历史记录。",
+                    "[deepseek-cursor-proxy] 已恢复",
                 )
             ),
         }
@@ -206,7 +206,7 @@ class TraceWriter:
                 "pid": os.getpid(),
                 "base_dir": str(self.base_dir),
                 "session_dir": str(self.session_dir),
-                "format": "one JSON file per traced POST request",
+                "format": "每个已追踪的 POST 请求对应一个 JSON 文件",
             },
         )
 

@@ -136,10 +136,9 @@ def scoped_reasoning_keys(message: dict[str, Any], scope: str) -> list[str]:
         for tool_call in (message.get("tool_calls") or [])
         if isinstance(tool_call, dict)
     )
-    # Recovery-of-last-resort key. Catches the case where a streaming response
-    # was interrupted (user pressed Stop) before the tool_call.id chunk arrived,
-    # so neither tool_call_id nor tool_call_signature (which canonicalizes
-    # arguments) survives the round-trip through Cursor's transcript.
+    # 最后手段的恢复键。处理流式响应在用户按停止后、tool_call.id 块到达前
+    # 被中断的情况，此时 tool_call_id 和 tool_call_signature（规范化参数）
+    # 都无法在 Cursor 对话记录往返中保留。
     keys.extend(
         f"scope:{scope}:tool_name:{tool_name}" for tool_name in tool_call_names(message)
     )
@@ -311,6 +310,17 @@ class ReasoningStore:
             self._conn.execute("DELETE FROM reasoning_cache")
             self._conn.commit()
         return count
+
+    def clear_namespace(self, namespace: str) -> int:
+        with self._lock:
+            pattern = f"%namespace:{namespace}:%"
+            cursor = self._conn.execute(
+                "DELETE FROM reasoning_cache WHERE key LIKE ?",
+                (pattern,),
+            )
+            deleted = cursor.rowcount if cursor.rowcount != -1 else 0
+            self._conn.commit()
+        return deleted
 
     def prune(self) -> int:
         with self._lock:

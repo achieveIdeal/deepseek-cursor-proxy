@@ -20,7 +20,9 @@ from deepseek_cursor_proxy.reasoning_store import (
 from deepseek_cursor_proxy.transform import (
     RECOVERY_NOTICE_CONTENT,
     RECOVERY_NOTICE_TEXT,
+    RESPONSE_LANGUAGE_INSTRUCTIONS,
     extract_text_content,
+    inject_response_language_instruction,
     normalize_reasoning_effort,
     prepare_upstream_request,
     reasoning_cache_namespace,
@@ -52,7 +54,7 @@ class ContentHelpersTests(unittest.TestCase):
         ]
         self.assertEqual(
             extract_text_content(content),
-            "hello\n[image_url omitted by DeepSeek text proxy]\nworld",
+            "hello\n[image_url 已由 DeepSeek 文本代理省略]\nworld",
         )
 
     def test_extract_text_content_passes_through_string_and_none(self) -> None:
@@ -62,7 +64,7 @@ class ContentHelpersTests(unittest.TestCase):
     def test_strip_cursor_thinking_blocks_removes_details_and_think(self) -> None:
         self.assertEqual(
             strip_cursor_thinking_blocks(
-                "<details>\n<summary>Thinking</summary>\n\nplan\n</details>\n\nanswer"
+                "<details>\n<summary>思考</summary>\n\nplan\n</details>\n\nanswer"
             ),
             "answer",
         )
@@ -184,7 +186,7 @@ class RequestPreparationTests(unittest.TestCase):
                 self.store,
             )
         self.assertEqual(prepared.payload["model"], "deepseek-v4-pro")
-        self.assertIn("non-DeepSeek", "\n".join(captured.output))
+        self.assertIn("非 DeepSeek", "\n".join(captured.output))
 
     def test_thinking_disabled_strips_reasoning_from_assistant_history(self) -> None:
         prepared = prepare_upstream_request(
@@ -219,6 +221,50 @@ class RequestPreparationTests(unittest.TestCase):
             self.store,
         )
         self.assertEqual(prepared.missing_reasoning_messages, 0)
+
+    def test_default_response_language_injects_chinese_instruction(self) -> None:
+        prepared = prepare_upstream_request(
+            {
+                "model": "deepseek-v4-pro",
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+            ProxyConfig(),
+            self.store,
+        )
+        system_messages = [
+            message
+            for message in prepared.payload["messages"]
+            if message.get("role") == "system"
+        ]
+        self.assertEqual(len(system_messages), 1)
+        self.assertEqual(
+            system_messages[0]["content"],
+            RESPONSE_LANGUAGE_INSTRUCTIONS["zh"],
+        )
+
+    def test_response_language_off_skips_instruction(self) -> None:
+        prepared = prepare_upstream_request(
+            {
+                "model": "deepseek-v4-pro",
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+            ProxyConfig(response_language=None),
+            self.store,
+        )
+        self.assertFalse(
+            any(message.get("role") == "system" for message in prepared.payload["messages"])
+        )
+
+    def test_response_language_instruction_is_not_duplicated(self) -> None:
+        messages = inject_response_language_instruction(
+            [
+                {"role": "system", "content": "Cursor rules"},
+                {"role": "user", "content": "hi"},
+            ],
+            "zh",
+        )
+        once = inject_response_language_instruction(messages, "zh")
+        self.assertEqual(len(once), len(messages))
 
 
 class RecoveryNoticeStrippingTests(unittest.TestCase):
@@ -356,12 +402,13 @@ class CrossModeAndModelTests(unittest.TestCase):
 
     def setUp(self) -> None:
         self.store = ReasoningStore(":memory:")
+        self.config = ProxyConfig(response_language=None)
 
     def tearDown(self) -> None:
         self.store.close()
 
     def test_deepseek_pro_and_flash_share_reasoning_namespace(self) -> None:
-        config = ProxyConfig()
+        config = self.config
         namespace_pro = reasoning_cache_namespace(
             config,
             "deepseek-v4-pro",
@@ -455,7 +502,7 @@ class CrossModeAndModelTests(unittest.TestCase):
                     {"role": "assistant", "content": "", "tool_calls": [tool_call]},
                 ],
             },
-            ProxyConfig(),
+            self.config,
             self.store,
         )
         # Plan re-request: scope changed (different system prompt) but the
@@ -468,7 +515,7 @@ class CrossModeAndModelTests(unittest.TestCase):
                     {"role": "assistant", "content": "", "tool_calls": [tool_call]},
                 ],
             },
-            ProxyConfig(),
+            self.config,
             self.store,
         )
 
@@ -541,7 +588,10 @@ class CrossModeAndModelTests(unittest.TestCase):
                     {"role": "user", "content": "continue"},
                 ],
             },
-            ProxyConfig(missing_reasoning_strategy="reject"),
+            ProxyConfig(
+                missing_reasoning_strategy="reject",
+                response_language=None,
+            ),
             self.store,
         )
 
@@ -603,7 +653,7 @@ class CrossModeAndModelTests(unittest.TestCase):
                     {"role": "assistant", "content": "", "tool_calls": [tool_call]},
                 ],
             },
-            ProxyConfig(),
+            self.config,
             self.store,
         )
 
@@ -700,7 +750,10 @@ class CrossModeAndModelTests(unittest.TestCase):
 
         second_prepared = prepare_upstream_request(
             second_payload,
-            ProxyConfig(missing_reasoning_strategy="recover"),
+            ProxyConfig(
+                missing_reasoning_strategy="recover",
+                response_language=None,
+            ),
             self.store,
         )
 
@@ -805,7 +858,10 @@ class StopMidStreamingToolCallTests(unittest.TestCase):
         }
         second_prepared = prepare_upstream_request(
             second_payload,
-            ProxyConfig(missing_reasoning_strategy="recover"),
+            ProxyConfig(
+                missing_reasoning_strategy="recover",
+                response_language=None,
+            ),
             self.store,
         )
 
@@ -822,7 +878,10 @@ class StopMidStreamingToolCallTests(unittest.TestCase):
         # The strict scope already differs (each turn has more prior
         # messages) so the two cached entries should not collide and the
         # second turn's reasoning must not leak into the first turn's slot.
-        config = ProxyConfig(missing_reasoning_strategy="recover")
+        config = ProxyConfig(
+            missing_reasoning_strategy="recover",
+            response_language=None,
+        )
 
         def cache_partial(payload: dict, reasoning: str, args_fragment: str) -> dict:
             prepared = prepare_upstream_request(payload, config, self.store)

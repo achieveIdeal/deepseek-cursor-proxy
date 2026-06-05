@@ -74,23 +74,23 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
         request_path = urlparse(self.path).path
         if self.config.verbose:
             LOG.info(
-                "incoming OPTIONS %s from %s",
+                "收到 OPTIONS %s，来自 %s",
                 request_path,
                 self.client_address[0],
             )
-        self._send_response_headers(204, [], "sending CORS preflight response")
+        self._send_response_headers(204, [], "发送 CORS 预检响应")
 
     def do_GET(self) -> None:
         request_path = urlparse(self.path).path
         if self.config.verbose:
-            LOG.info("incoming GET %s from %s", request_path, self.client_address[0])
+            LOG.info("收到 GET %s，来自 %s", request_path, self.client_address[0])
         if request_path in {"/healthz", "/v1/healthz"}:
             self._send_json(200, {"ok": True})
             return
         if request_path in {"/models", "/v1/models"}:
             self._send_models()
             return
-        self._send_json(404, {"error": {"message": "Not found"}})
+        self._send_json(404, {"error": {"message": "未找到"}})
 
     def do_POST(self) -> None:
         started = time.monotonic()
@@ -98,18 +98,18 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
         trace = self._start_trace(request_path)
         if self.config.verbose:
             LOG.info(
-                "incoming POST %s from %s content_length=%s user_agent=%s",
+                "收到 POST %s，来自 %s content_length=%s user_agent=%s",
                 request_path,
                 self.client_address[0],
                 self.headers.get("Content-Length", "0"),
                 self.headers.get("User-Agent", ""),
             )
         if request_path not in {"/chat/completions", "/v1/chat/completions"}:
-            LOG.warning("rejected unsupported POST path=%s status=404", request_path)
+            LOG.warning("拒绝不支持的 POST path=%s status=404", request_path)
             self._record_request_body_for_trace(trace)
             self._send_json(
                 404,
-                {"error": {"message": "Only /v1/chat/completions is supported"}},
+                {"error": {"message": "仅支持 /v1/chat/completions"}},
                 trace=trace,
             )
             self._finish_trace(trace, "rejected", http_status=404)
@@ -117,13 +117,13 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
         cursor_authorization = self._cursor_authorization()
         if cursor_authorization is None:
             LOG.warning(
-                "rejected request path=%s status=401 reason=missing_bearer_token",
+                "拒绝请求 path=%s status=401 reason=missing_bearer_token",
                 request_path,
             )
             self._record_request_body_for_trace(trace)
             self._send_json(
                 401,
-                {"error": {"message": "Missing Authorization bearer token"}},
+                {"error": {"message": "缺少 Authorization bearer 令牌"}},
                 trace=trace,
             )
             self._finish_trace(trace, "rejected", http_status=401)
@@ -133,14 +133,14 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
             payload = self._read_json_body()
         except RequestBodyTooLarge as exc:
             LOG.warning(
-                "rejected request path=%s status=413 reason=%s", request_path, exc
+                "拒绝请求 path=%s status=413 reason=%s", request_path, exc
             )
             self._send_json(413, {"error": {"message": str(exc)}}, trace=trace)
             self._finish_trace(trace, "rejected", http_status=413, reason=str(exc))
             return
         except ValueError as exc:
             LOG.warning(
-                "rejected request path=%s status=400 reason=%s", request_path, exc
+                "拒绝请求 path=%s status=400 reason=%s", request_path, exc
             )
             self._send_json(400, {"error": {"message": str(exc)}}, trace=trace)
             self._finish_trace(trace, "rejected", http_status=400, reason=str(exc))
@@ -150,7 +150,7 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
             trace.record_cursor_body(payload)
 
         if self.config.verbose:
-            log_json("cursor request body", payload)
+            log_json("Cursor 请求体", payload)
 
         log_cursor_request(payload, self.config)
 
@@ -169,7 +169,7 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
         ):
             LOG.warning(
                 (
-                    "strict missing-reasoning mode rejected request path=%s "
+                    "严格缺失-reasoning 模式拒绝请求 path=%s "
                     "status=409 reason=missing_reasoning_content count=%s"
                 ),
                 request_path,
@@ -180,15 +180,13 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                 {
                     "error": {
                         "message": (
-                            "deepseek-cursor-proxy is running in strict "
-                            "missing-reasoning mode and cannot automatically "
-                            "recover this thinking-mode tool-call history because "
-                            "cached DeepSeek reasoning_content is missing for "
-                            f"{prepared.missing_reasoning_messages} assistant "
-                            "message(s). Restart without "
-                            "`--missing-reasoning-strategy reject`, or pass "
-                            "`--missing-reasoning-strategy recover`, so the proxy "
-                            "can recover from partial chat history automatically."
+                            "deepseek-cursor-proxy 正在严格缺失-reasoning 模式下运行，"
+                            "无法自动恢复此思考模式工具调用历史，因为 "
+                            f"{prepared.missing_reasoning_messages} 条助手消息"
+                            "缺少缓存的 DeepSeek reasoning_content。"
+                            "请在不使用 `--missing-reasoning-strategy reject` 的情况下重启，"
+                            "或传入 `--missing-reasoning-strategy recover`，"
+                            "以便代理自动从部分对话历史中恢复。"
                         ),
                         "type": "missing_reasoning_content",
                         "code": "missing_reasoning_content",
@@ -203,7 +201,7 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
         if self.config.verbose:
             LOG.info(
                 (
-                    "upstream request metadata: original_model=%s upstream_model=%s "
+                    "上游请求元数据: original_model=%s upstream_model=%s "
                     "patched_reasoning=%s missing_reasoning=%s %s"
                 ),
                 prepared.original_model,
@@ -214,7 +212,7 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
             )
 
         if self.config.verbose:
-            log_json("upstream request body", prepared.payload)
+            log_json("上游请求体", prepared.payload)
 
         upstream_body = json.dumps(
             prepared.payload, ensure_ascii=False, separators=(",", ":")
@@ -246,12 +244,12 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
 
         try:
             if self.config.verbose:
-                LOG.info("forwarding to %s", upstream_url)
+                LOG.info("正在转发到 %s", upstream_url)
             response = urlopen(request, timeout=self.config.request_timeout)
         except HTTPError as exc:
             spinner.stop()
             LOG.warning(
-                "request failed upstream_status=%s stream=%s elapsed_ms=%s",
+                "请求失败 upstream_status=%s stream=%s elapsed_ms=%s",
                 exc.code,
                 bool(prepared.payload.get("stream")),
                 elapsed_ms(started),
@@ -267,13 +265,13 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
         except URLError as exc:
             spinner.stop()
             LOG.warning(
-                "upstream request failed elapsed_ms=%s reason=%s",
+                "上游请求失败 elapsed_ms=%s reason=%s",
                 elapsed_ms(started),
                 exc.reason,
             )
             self._send_json(
                 502,
-                {"error": {"message": f"Upstream request failed: {exc.reason}"}},
+                {"error": {"message": f"上游请求失败: {exc.reason}"}},
                 trace=trace,
             )
             self._finish_trace(trace, "upstream_error", http_status=502)
@@ -287,7 +285,7 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                 upstream_status = getattr(response, "status", 200)
                 if self.config.verbose:
                     LOG.info(
-                        "upstream response status=%s stream=%s elapsed_ms=%s",
+                        "上游响应 status=%s stream=%s elapsed_ms=%s",
                         upstream_status,
                         bool(prepared.payload.get("stream")),
                         elapsed_ms(started),
@@ -348,7 +346,7 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                 headers={name: value for name, value in self.headers.items()},
             )
         except OSError as exc:
-            LOG.warning("failed to start request trace: %s", exc)
+            LOG.warning("启动请求追踪失败: %s", exc)
             return None
 
     def _finish_trace(
@@ -362,7 +360,7 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
         try:
             trace.finish(status, **extra)
         except OSError as exc:
-            LOG.warning("failed to write request trace: %s", exc)
+            LOG.warning("写入请求追踪失败: %s", exc)
 
     def _cursor_authorization(self) -> str | None:
         auth_header = self.headers.get("Authorization", "")
@@ -408,10 +406,10 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                 ("Content-Type", "application/json"),
                 ("Content-Length", str(len(body))),
             ],
-            "sending JSON response headers",
+            "发送 JSON 响应头",
         )
         if sent_headers:
-            self._write_to_client(body, "sending JSON response body")
+            self._write_to_client(body, "发送 JSON 响应体")
 
     def _send_response_headers(
         self,
@@ -426,7 +424,7 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                 self.send_header(name, value)
             self.end_headers()
         except (BrokenPipeError, ConnectionError) as exc:
-            LOG.warning("client disconnected while %s: %s", disconnect_context, exc)
+            LOG.warning("客户端断开连接（%s）: %s", disconnect_context, exc)
             return False
         return True
 
@@ -442,7 +440,7 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
             if flush:
                 self.wfile.flush()
         except (BrokenPipeError, ConnectionError) as exc:
-            LOG.warning("client disconnected while %s: %s", disconnect_context, exc)
+            LOG.warning("客户端断开连接（%s）: %s", disconnect_context, exc)
             return False
         return True
 
@@ -472,22 +470,22 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
         try:
             length = int(self.headers.get("Content-Length") or 0)
         except ValueError as exc:
-            raise ValueError("Invalid Content-Length") from exc
+            raise ValueError("无效的 Content-Length") from exc
         if length < 0:
-            raise ValueError("Invalid Content-Length")
+            raise ValueError("无效的 Content-Length")
         if length > self.config.max_request_body_bytes:
             raise RequestBodyTooLarge(
-                f"Request body is too large; limit is {self.config.max_request_body_bytes} bytes"
+                f"请求体过大；限制为 {self.config.max_request_body_bytes} 字节"
             )
         raw_body = self.rfile.read(length)
         if not raw_body:
-            raise ValueError("Request body is empty")
+            raise ValueError("请求体为空")
         try:
             payload = json.loads(raw_body.decode("utf-8"))
         except json.JSONDecodeError as exc:
-            raise ValueError(f"Invalid JSON: {exc}") from exc
+            raise ValueError(f"无效的 JSON: {exc}") from exc
         if not isinstance(payload, dict):
-            raise ValueError("Request body must be a JSON object")
+            raise ValueError("请求体必须是 JSON 对象")
         return payload
 
     def _record_request_body_for_trace(self, trace: TraceRequest | None) -> None:
@@ -537,7 +535,7 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
     ) -> None:
         body = read_response_body(exc)
         if self.config.verbose:
-            log_bytes("upstream error body", body)
+            log_bytes("上游错误响应体", body)
         headers = {
             "Content-Type": exc.headers.get("Content-Type", "application/json"),
             "Content-Length": str(len(body)),
@@ -555,10 +553,10 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                 ("Content-Type", headers["Content-Type"]),
                 ("Content-Length", headers["Content-Length"]),
             ],
-            "sending upstream error headers",
+            "发送上游错误响应头",
         )
         if sent_headers:
-            self._write_to_client(body, "sending upstream error body")
+            self._write_to_client(body, "发送上游错误响应体")
 
     def _proxy_regular_response(
         self,
@@ -590,10 +588,10 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                 collapsible_reasoning=self.config.collapsible_reasoning,
             )
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-            LOG.warning("failed to rewrite upstream JSON response: %s", exc)
+            LOG.warning("重写上游 JSON 响应失败: %s", exc)
 
         if self.config.verbose:
-            log_bytes("cursor response body", body)
+            log_bytes("Cursor 响应体", body)
 
         headers = {
             "Content-Type": response.headers.get("Content-Type", "application/json"),
@@ -624,11 +622,11 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                 ("Content-Type", headers["Content-Type"]),
                 ("Content-Length", headers["Content-Length"]),
             ],
-            "sending upstream response headers",
+            "发送上游响应头",
         )
         if not sent_headers:
             return ProxyResponseResult(False, usage)
-        sent = self._write_to_client(body, "sending upstream response body")
+        sent = self._write_to_client(body, "发送上游响应体")
         return ProxyResponseResult(sent, usage)
 
     def _proxy_streaming_response(
@@ -664,7 +662,7 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                 ("Cache-Control", "no-cache"),
                 ("Connection", "close"),
             ],
-            "sending streaming response headers",
+            "发送流式响应头",
         )
         if not sent_headers:
             return ProxyResponseResult(False)
@@ -699,7 +697,7 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                 try:
                     line = response.readline()
                 except (HTTPException, OSError) as exc:
-                    LOG.warning("upstream streaming response read failed: %s", exc)
+                    LOG.warning("读取上游流式响应失败: %s", exc)
                     return ProxyResponseResult(False, usage)
                 if not line:
                     break
@@ -723,20 +721,18 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                 if trace is not None:
                     trace.record_stream_chunk(line, rewritten)
                 if not self._write_to_client(
-                    rewritten, "sending streaming response chunk", flush=True
+                    rewritten, "发送流式响应块", flush=True
                 ):
                     return ProxyResponseResult(False, usage)
                 if finalized:
                     break
         finally:
-            # Store partial reasoning whenever the stream exits without
-            # the upstream's [DONE] terminator (client disconnect, upstream
-            # read failure, exception). Without this, a Stop pressed mid-stream
-            # would discard any reasoning the proxy received but never cached.
+            # 当流在上游 [DONE] 终止符之前退出时（客户端断开、上游读取失败、
+            # 异常），存储部分 reasoning。否则，中途按停止会丢弃代理已收到但未缓存的 reasoning。
             if not finalized:
                 if self.config.verbose:
                     log_json(
-                        "model streaming assistant messages", accumulator.messages()
+                        "模型流式助手消息", accumulator.messages()
                     )
                 stored = sum(
                     accumulator.store_reasoning(
@@ -749,7 +745,7 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                 )
                 if self.config.verbose and stored:
                     LOG.info(
-                        "stored %s streaming reasoning cache key(s) before exit",
+                        "退出前已存储 %s 个流式 reasoning 缓存键",
                         stored,
                     )
         return ProxyResponseResult(True, usage)
@@ -772,7 +768,7 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
         data = stripped[len(b"data:") :].strip()
         if data == b"[DONE]":
             if self.config.verbose:
-                log_json("model streaming assistant messages", accumulator.messages())
+                log_json("模型流式助手消息", accumulator.messages())
             stored = sum(
                 accumulator.store_reasoning(
                     self.reasoning_store,
@@ -783,7 +779,7 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                 for scope, prior_messages in response_contexts
             )
             if self.config.verbose and stored:
-                LOG.info("stored %s streaming reasoning cache key(s)", stored)
+                LOG.info("已存储 %s 个流式 reasoning 缓存键", stored)
             prefix = b""
             if display_adapter is None:
                 if recovery_notice:
@@ -819,7 +815,7 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                 for scope, prior_messages in response_contexts
             )
             if self.config.verbose and stored:
-                LOG.info("stored %s streaming reasoning cache key(s)", stored)
+                LOG.info("已存储 %s 个流式 reasoning 缓存键", stored)
             chunk_usage = chunk.get("usage")
             if trace is not None:
                 trace.record_usage(chunk_usage)
@@ -844,84 +840,84 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run the local DeepSeek Cursor proxy")
+    parser = argparse.ArgumentParser(description="运行本地 DeepSeek Cursor 代理")
     parser.add_argument(
         "--config",
         dest="config_path",
         type=Path,
-        help=f"YAML config file, default {default_config_path()}",
+        help=f"YAML 配置文件，默认 {default_config_path()}",
     )
-    parser.add_argument("--host", help="Bind host, default from config or 127.0.0.1")
+    parser.add_argument("--host", help="绑定主机，默认来自配置或 127.0.0.1")
     parser.add_argument(
         "--port",
         type=int,
-        help="Bind port, default from config or 9000",
+        help="绑定端口，默认来自配置或 9000",
     )
     parser.add_argument(
         "--model",
         help=(
-            "Fallback DeepSeek model when the request has no model, "
-            "default from config or deepseek-v4-pro"
+            "请求未指定模型时的 DeepSeek 回退模型，"
+            "默认来自配置或 deepseek-v4-pro"
         ),
     )
     parser.add_argument(
         "--base-url",
-        help=("DeepSeek base URL, default from config or https://api.deepseek.com"),
+        help=("DeepSeek 基础 URL，默认来自配置或 https://api.deepseek.com"),
     )
     parser.add_argument(
         "--thinking",
         choices=["enabled", "disabled"],
-        help="DeepSeek thinking mode, default from config or enabled",
+        help="DeepSeek 思考模式，默认来自配置或 enabled",
     )
     parser.add_argument(
         "--reasoning-effort",
         choices=["low", "medium", "high", "max", "xhigh"],
-        help="DeepSeek reasoning effort, default from config or max",
+        help="DeepSeek reasoning 力度，默认来自配置或 max",
     )
     parser.add_argument(
         "--reasoning-content-path",
         type=Path,
         help=(
-            "SQLite reasoning_content cache path, "
-            f"default {default_reasoning_content_path()}"
+            "SQLite reasoning_content 缓存路径，"
+            f"默认 {default_reasoning_content_path()}"
         ),
     )
     parser.add_argument(
         "--ngrok",
         action=argparse.BooleanOptionalAction,
         default=None,
-        help="Start an ngrok tunnel and print the Cursor base URL",
+        help="启动 ngrok 隧道并打印 Cursor 基础 URL",
     )
     parser.add_argument(
         "--ngrok-url",
         metavar="URL",
         help=(
-            "Pass --url=URL to ngrok (reserved endpoint / custom domain); "
-            "see `ngrok http --help`"
+            "向 ngrok 传递 --url=URL（保留端点/自定义域名）；"
+            "参见 `ngrok http --help`"
         ),
     )
     parser.add_argument(
         "--verbose",
         action=argparse.BooleanOptionalAction,
         default=None,
-        help="Log detailed request metadata and full payloads",
+        help="记录详细请求元数据和完整载荷",
     )
     parser.add_argument(
         "--trace-dir",
         type=Path,
-        help="Write full structured request traces to this directory",
+        help="将完整结构化请求追踪写入此目录",
     )
     parser.add_argument(
         "--display-reasoning",
         action=argparse.BooleanOptionalAction,
         default=None,
-        help="Mirror reasoning_content into Cursor-visible content",
+        help="将 reasoning_content 镜像到 Cursor 可见内容",
     )
     parser.add_argument(
         "--collapsible-reasoning",
         action=argparse.BooleanOptionalAction,
         default=None,
-        help="Use Markdown details for mirrored reasoning when display is enabled",
+        help="启用显示时使用 Markdown details 展示镜像的 reasoning",
     )
     parser.add_argument(
         "--collasible-reasoning",
@@ -943,40 +939,61 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--cors",
         action=argparse.BooleanOptionalAction,
         default=None,
-        help="Send permissive CORS headers",
+        help="发送宽松的 CORS 响应头",
     )
     parser.add_argument(
         "--request-timeout",
         type=float,
-        help="Upstream request timeout in seconds, default from config or 300",
+        help="上游请求超时（秒），默认来自配置或 300",
     )
     parser.add_argument(
         "--max-request-body-bytes",
         type=int,
-        help="Maximum accepted request body size, default from config",
+        help="最大可接受请求体大小，默认来自配置",
     )
     parser.add_argument(
         "--reasoning-cache-max-age-seconds",
         type=int,
-        help="Maximum reasoning cache row age in seconds, default from config",
+        help="reasoning 缓存行最大存活时间（秒），默认来自配置",
     )
     parser.add_argument(
         "--reasoning-cache-max-rows",
         type=int,
-        help="Maximum reasoning cache rows, default from config",
+        help="reasoning 缓存最大行数，默认来自配置",
     )
     parser.add_argument(
         "--missing-reasoning-strategy",
         choices=["recover", "reject"],
         help=(
-            "What to do when required reasoning_content is missing: "
-            "recover (friendly default) or reject (strict debugging mode)"
+            "缺少必需 reasoning_content 时的处理方式："
+            "recover（友好默认）或 reject（严格调试模式）"
         ),
     )
     parser.add_argument(
         "--clear-reasoning-cache",
         action="store_true",
-        help="Clear the local reasoning_content SQLite cache and exit",
+        help="清除本地 reasoning_content SQLite 缓存并退出",
+    )
+    parser.add_argument(
+        "--summary-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="消息超过阈值时自动摘要并重建对话",
+    )
+    parser.add_argument(
+        "--summary-max-messages",
+        type=int,
+        help="触发对话摘要的消息数阈值，默认 40",
+    )
+    parser.add_argument(
+        "--summary-keep-recent",
+        type=int,
+        help="摘要后重建时保留的最近消息数，默认 5",
+    )
+    parser.add_argument(
+        "--response-language",
+        choices=["zh", "en", "off"],
+        help="注入语言指令：zh（中文）、en（英文）或 off（关闭），默认来自配置或 zh",
     )
     return parser
 
@@ -1020,7 +1037,7 @@ def log_cursor_request(
 ) -> None:
     model = str(payload.get("model") or config.upstream_model)
     LOG.info(
-        "┌ request model=%s effort=%s messages=%s",
+        "┌ 请求 model=%s effort=%s messages=%s",
         model,
         config.reasoning_effort,
         format_count(message_count(payload)),
@@ -1031,12 +1048,12 @@ def log_context_summary(prepared: Any) -> None:
     status = context_status(prepared)
     if status == "ok":
         LOG.info(
-            "├ context status=ok reasoning_context=%s",
+            "├ 上下文 status=ok reasoning_context=%s",
             format_count(prepared.patched_reasoning_messages),
         )
         return
     LOG.info(
-        "├ context status=%s missing=%s recovered=%s dropped=%s",
+        "├ 上下文 status=%s missing=%s recovered=%s dropped=%s",
         status,
         format_count(prepared.missing_reasoning_messages),
         format_count(prepared.recovered_reasoning_messages),
@@ -1046,7 +1063,7 @@ def log_context_summary(prepared: Any) -> None:
 
 def log_send_summary(prepared: Any) -> None:
     LOG.info(
-        "├ send    user_msgs=%s messages=%s tools=%s reasoning_content=%s",
+        "├ 发送    user_msgs=%s messages=%s tools=%s reasoning_content=%s",
         format_count(user_message_count(prepared.payload)),
         format_count(message_count(prepared.payload)),
         format_count(tool_count(prepared.payload)),
@@ -1056,7 +1073,7 @@ def log_send_summary(prepared: Any) -> None:
 
 def log_stats_summary(usage: dict[str, Any] | None) -> None:
     LOG.info(
-        "└ stats   prompt=%s output=%s reasoning=%s cache_hit=%s",
+        "└ 统计    prompt=%s output=%s reasoning=%s cache_hit=%s",
         format_usage_count(usage, "prompt_tokens"),
         format_usage_count(usage, "completion_tokens"),
         format_count(reasoning_token_count(usage)),
@@ -1240,7 +1257,7 @@ def warn_if_insecure_upstream(url: str) -> None:
     host = parsed.hostname or ""
     if host in {"127.0.0.1", "localhost", "::1"}:
         return
-    LOG.warning("upstream base_url uses plain HTTP; bearer tokens may be exposed")
+    LOG.warning("上游 base_url 使用明文 HTTP；bearer 令牌可能暴露")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1293,6 +1310,16 @@ def main(argv: list[str] | None = None) -> int:
         updates["reasoning_cache_max_rows"] = args.reasoning_cache_max_rows
     if args.missing_reasoning_strategy is not None:
         updates["missing_reasoning_strategy"] = args.missing_reasoning_strategy
+    if args.summary_enabled is not None:
+        updates["summary_enabled"] = args.summary_enabled
+    if args.summary_max_messages is not None:
+        updates["summary_max_messages"] = args.summary_max_messages
+    if args.summary_keep_recent is not None:
+        updates["summary_keep_recent"] = args.summary_keep_recent
+    if args.response_language is not None:
+        updates["response_language"] = (
+            None if args.response_language == "off" else args.response_language
+        )
     if updates:
         config = replace(config, **updates)
 
@@ -1305,7 +1332,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     if args.clear_reasoning_cache:
         deleted = store.clear()
-        LOG.info("cleared %s reasoning cache row(s)", deleted)
+        LOG.info("已清除 %s 条 reasoning 缓存行", deleted)
         store.close()
         return 0
     trace_writer: TraceWriter | None = None
@@ -1313,7 +1340,7 @@ def main(argv: list[str] | None = None) -> int:
         try:
             trace_writer = TraceWriter(config.trace_dir)
         except OSError as exc:
-            LOG.error("failed to initialize trace directory: %s", exc)
+            LOG.error("初始化追踪目录失败: %s", exc)
             store.close()
             return 2
     server = DeepSeekProxyServer((config.host, config.port), DeepSeekProxyHandler)
@@ -1339,37 +1366,37 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     LOG.info(
-        "default_model: %s (%s, %s)",
+        "默认模型: %s（%s，%s）",
         config.upstream_model,
-        "thinking" if config.thinking == "enabled" else "no thinking",
+        "思考模式" if config.thinking == "enabled" else "无思考模式",
         config.reasoning_effort,
     )
 
     if config.verbose:
-        display_reasoning = "off"
+        display_reasoning = "关闭"
         if config.display_reasoning:
             display_reasoning = (
-                "on (collapsible)" if config.collapsible_reasoning else "on"
+                "开启（可折叠）" if config.collapsible_reasoning else "开启"
             )
-        LOG.info("display_reasoning: %s", display_reasoning)
-        LOG.info("missing_reasoning_strategy: %s", config.missing_reasoning_strategy)
-        LOG.info("reasoning_cache: %s", config.reasoning_content_path)
+        LOG.info("显示 reasoning: %s", display_reasoning)
+        LOG.info("缺失 reasoning 策略: %s", config.missing_reasoning_strategy)
+        LOG.info("reasoning 缓存: %s", config.reasoning_content_path)
         LOG.warning(
-            "verbose logging enabled; prompts and code may be written to stdout"
+            "已启用详细日志；提示词和代码可能写入 stdout"
         )
     if trace_writer is not None:
-        LOG.info("trace_dir: %s", trace_writer.session_dir)
-        LOG.warning("trace logging enabled; prompts and code will be written to disk")
+        LOG.info("追踪目录: %s", trace_writer.session_dir)
+        LOG.warning("已启用追踪日志；提示词和代码将写入磁盘")
     if public_url is None and not config.ngrok:
-        LOG.info("public_tunnel: off")
+        LOG.info("公网隧道: 关闭")
     if config.verbose:
-        LOG.info("upstream_url: %s/chat/completions", config.upstream_base_url)
-    LOG.info("local_base_url: %s", local_base_url)
-    LOG.info("api_base_url: %s", api_base_url)
+        LOG.info("上游 URL: %s/chat/completions", config.upstream_base_url)
+    LOG.info("本地基础 URL: %s", local_base_url)
+    LOG.info("API 基础 URL: %s", api_base_url)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        LOG.info("shutting down")
+        LOG.info("正在关闭")
     finally:
         if tunnel is not None:
             tunnel.stop()

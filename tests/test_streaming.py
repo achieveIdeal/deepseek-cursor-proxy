@@ -332,7 +332,7 @@ class CursorReasoningDisplayAdapterTests(unittest.TestCase):
         self.assertEqual(reasoning_delta["reasoning_content"], "Need context.")
         self.assertEqual(
             reasoning_delta["content"],
-            "<details>\n<summary>Thinking</summary>\n\nNeed context.",
+            "<details>\n<summary>思考</summary>\n\nNeed context.",
         )
         self.assertEqual(answer_delta["content"], "\n</details>\n\nFinal answer.")
 
@@ -450,7 +450,7 @@ class FoldReasoningTests(unittest.TestCase):
         fold_reasoning_into_content(payload, collapsible=True)
         self.assertEqual(
             payload["choices"][0]["message"]["content"],
-            "<details>\n<summary>Thinking</summary>\n\nthinking\n</details>\n\nanswer",
+            "<details>\n<summary>思考</summary>\n\nthinking\n</details>\n\nanswer",
         )
 
     def test_fold_reasoning_skips_empty_reasoning(self) -> None:

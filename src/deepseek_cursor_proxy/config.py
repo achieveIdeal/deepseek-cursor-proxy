@@ -31,15 +31,18 @@ DEFAULT_CORS = False
 DEFAULT_MISSING_REASONING_STRATEGY = "recover"
 DEFAULT_REASONING_CACHE_MAX_AGE_SECONDS = 30 * 24 * 60 * 60
 DEFAULT_REASONING_CACHE_MAX_ROWS = 100_000
+DEFAULT_SUMMARY_ENABLED = True
+DEFAULT_SUMMARY_MAX_MESSAGES = 40
+DEFAULT_SUMMARY_KEEP_RECENT = 5
+DEFAULT_RESPONSE_LANGUAGE = "zh"
 
 DEFAULT_CONFIG_HEADER = (
-    "# This file was created automatically at ~/.deepseek-cursor-proxy/config.yaml."
+    "# 此文件在 ~/.deepseek-cursor-proxy/config.yaml 自动创建。"
 )
 DEFAULT_CONFIG_TEXT = f"""{DEFAULT_CONFIG_HEADER}
-# API keys are read from Cursor's Authorization header and forwarded upstream.
+# API 密钥从 Cursor 的 Authorization 请求头读取并转发到上游。
 
-# `model` is the fallback when a request has no model; Cursor's requested
-# DeepSeek model name is otherwise respected.
+# `model` 是请求未指定模型时的回退值；否则使用 Cursor 请求的 DeepSeek 模型名。
 base_url: {DEFAULT_UPSTREAM_BASE_URL}
 model: {DEFAULT_UPSTREAM_MODEL}
 thinking: {DEFAULT_THINKING}
@@ -59,6 +62,9 @@ reasoning_content_path: {REASONING_CONTENT_FILE_NAME}
 missing_reasoning_strategy: {DEFAULT_MISSING_REASONING_STRATEGY}
 reasoning_cache_max_age_seconds: {DEFAULT_REASONING_CACHE_MAX_AGE_SECONDS}
 reasoning_cache_max_rows: {DEFAULT_REASONING_CACHE_MAX_ROWS}
+
+# 注入语言指令，使模型用指定语言思考和回答；设为 off 可关闭。
+response_language: {DEFAULT_RESPONSE_LANGUAGE}
 """
 
 
@@ -89,11 +95,11 @@ def load_config_file(config_path: str | Path) -> dict[str, Any]:
     try:
         loaded = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     except yaml.YAMLError as exc:
-        raise ValueError(f"Invalid YAML config at {config_path}: {exc}") from exc
+        raise ValueError(f"无效的 YAML 配置 {config_path}: {exc}") from exc
     if loaded is None:
         return {}
     if not isinstance(loaded, Mapping):
-        raise ValueError(f"Config file must contain a YAML mapping: {config_path}")
+        raise ValueError(f"配置文件必须包含 YAML 映射: {config_path}")
     return dict(loaded)
 
 
@@ -191,6 +197,19 @@ def normalize_missing_reasoning_strategy(value: Any) -> str:
     return DEFAULT_MISSING_REASONING_STRATEGY
 
 
+def normalize_response_language(value: Any) -> str | None:
+    if value is MISSING:
+        return DEFAULT_RESPONSE_LANGUAGE
+    if value is None:
+        return DEFAULT_RESPONSE_LANGUAGE
+    normalized = str(value).strip().lower()
+    if normalized in {"", "off", "none", "disabled", "false"}:
+        return None
+    if normalized in {"zh", "en"}:
+        return normalized
+    return DEFAULT_RESPONSE_LANGUAGE
+
+
 @dataclass(frozen=True)
 class ProxyConfig:
     host: str = DEFAULT_HOST
@@ -212,6 +231,10 @@ class ProxyConfig:
     ngrok: bool = DEFAULT_NGROK
     ngrok_url: str | None = None
     trace_dir: Path | None = None
+    summary_enabled: bool = DEFAULT_SUMMARY_ENABLED
+    summary_max_messages: int = DEFAULT_SUMMARY_MAX_MESSAGES
+    summary_keep_recent: int = DEFAULT_SUMMARY_KEEP_RECENT
+    response_language: str | None = DEFAULT_RESPONSE_LANGUAGE
 
     @classmethod
     def from_file(
@@ -292,4 +315,19 @@ class ProxyConfig:
                 DEFAULT_NGROK,
             ),
             ngrok_url=as_optional_str(setting_value(settings, "ngrok_url")),
+            summary_enabled=as_bool(
+                setting_value(settings, "summary_enabled"),
+                DEFAULT_SUMMARY_ENABLED,
+            ),
+            summary_max_messages=as_int(
+                setting_value(settings, "summary_max_messages"),
+                DEFAULT_SUMMARY_MAX_MESSAGES,
+            ),
+            summary_keep_recent=as_int(
+                setting_value(settings, "summary_keep_recent"),
+                DEFAULT_SUMMARY_KEEP_RECENT,
+            ),
+            response_language=normalize_response_language(
+                setting_value(settings, "response_language")
+            ),
         )
