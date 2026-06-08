@@ -975,22 +975,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="清除本地 reasoning_content SQLite 缓存并退出",
     )
     parser.add_argument(
-        "--summary-enabled",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-        help="消息超过阈值时自动摘要并重建对话",
-    )
-    parser.add_argument(
-        "--summary-max-messages",
-        type=int,
-        help="触发对话摘要的消息数阈值，默认 40",
-    )
-    parser.add_argument(
-        "--summary-keep-recent",
-        type=int,
-        help="摘要后重建时保留的最近消息数，默认 5",
-    )
-    parser.add_argument(
         "--response-language",
         choices=["zh", "en", "off"],
         help="注入语言指令：zh（中文）、en（英文）或 off（关闭），默认来自配置或 zh",
@@ -1310,12 +1294,6 @@ def main(argv: list[str] | None = None) -> int:
         updates["reasoning_cache_max_rows"] = args.reasoning_cache_max_rows
     if args.missing_reasoning_strategy is not None:
         updates["missing_reasoning_strategy"] = args.missing_reasoning_strategy
-    if args.summary_enabled is not None:
-        updates["summary_enabled"] = args.summary_enabled
-    if args.summary_max_messages is not None:
-        updates["summary_max_messages"] = args.summary_max_messages
-    if args.summary_keep_recent is not None:
-        updates["summary_keep_recent"] = args.summary_keep_recent
     if args.response_language is not None:
         updates["response_language"] = (
             None if args.response_language == "off" else args.response_language

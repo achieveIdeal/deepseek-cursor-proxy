@@ -31,9 +31,6 @@ DEFAULT_CORS = False
 DEFAULT_MISSING_REASONING_STRATEGY = "recover"
 DEFAULT_REASONING_CACHE_MAX_AGE_SECONDS = 30 * 24 * 60 * 60
 DEFAULT_REASONING_CACHE_MAX_ROWS = 100_000
-DEFAULT_SUMMARY_ENABLED = True
-DEFAULT_SUMMARY_MAX_MESSAGES = 40
-DEFAULT_SUMMARY_KEEP_RECENT = 5
 DEFAULT_RESPONSE_LANGUAGE = "zh"
 
 DEFAULT_CONFIG_HEADER = (
@@ -231,9 +228,6 @@ class ProxyConfig:
     ngrok: bool = DEFAULT_NGROK
     ngrok_url: str | None = None
     trace_dir: Path | None = None
-    summary_enabled: bool = DEFAULT_SUMMARY_ENABLED
-    summary_max_messages: int = DEFAULT_SUMMARY_MAX_MESSAGES
-    summary_keep_recent: int = DEFAULT_SUMMARY_KEEP_RECENT
     response_language: str | None = DEFAULT_RESPONSE_LANGUAGE
 
     @classmethod
@@ -315,18 +309,6 @@ class ProxyConfig:
                 DEFAULT_NGROK,
             ),
             ngrok_url=as_optional_str(setting_value(settings, "ngrok_url")),
-            summary_enabled=as_bool(
-                setting_value(settings, "summary_enabled"),
-                DEFAULT_SUMMARY_ENABLED,
-            ),
-            summary_max_messages=as_int(
-                setting_value(settings, "summary_max_messages"),
-                DEFAULT_SUMMARY_MAX_MESSAGES,
-            ),
-            summary_keep_recent=as_int(
-                setting_value(settings, "summary_keep_recent"),
-                DEFAULT_SUMMARY_KEEP_RECENT,
-            ),
             response_language=normalize_response_language(
                 setting_value(settings, "response_language")
             ),

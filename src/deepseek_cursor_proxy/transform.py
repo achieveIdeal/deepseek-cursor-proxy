@@ -5,8 +5,6 @@ import hashlib
 import json
 import re
 from typing import Any
-import urllib.request
-from urllib.error import HTTPError, URLError
 
 from .config import ProxyConfig
 from .logging import LOG
@@ -86,7 +84,7 @@ CURSOR_THINKING_BLOCK_RE = re.compile(
         <(?:think|thinking)\b[^>]*>[\s\S]*?(?:</(?:think|thinking)>|\Z)
         |
         <details\b[^>]*>\s*
-        <summary\b[^>]*>\s*Thinking\s*</summary>
+        <summary\b[^>]*>\s*(?:Thinking|思考)\s*</summary>
         [\s\S]*?(?:</details>|\Z)
     )\s*
     """,
@@ -100,14 +98,18 @@ RECOVERY_SYSTEM_CONTENT = (
     "reasoning_content 不可用。已省略无法恢复的较早工具调用历史；请仅使用剩余已恢复的上下文继续。"
 )
 
-SUMMARY_SYSTEM_PREFIX = (
-    "[deepseek-cursor-proxy] 对话摘要（已保留先前上下文）：\n\n"
-)
 
 RESPONSE_LANGUAGE_INSTRUCTIONS = {
     "zh": (
-        "请始终使用中文进行思考和回答。"
-        "你的 reasoning_content（思考过程）和最终回复内容都必须使用中文。"
+        "你必须始终使用中文（简体中文）进行思考。"
+        "你的所有 reasoning_content（思考过程）、内部推理、分析、计划都必须使用中文，"
+        "绝对不要使用英文或其他语言进行思考。"
+        "你的最终回复内容也必须使用中文。"
+        "\n\n"
+        "CRITICAL: You MUST think in Chinese (Simplified Chinese) at all times. "
+        "All your reasoning_content, internal thoughts, analysis, and planning "
+        "MUST be in Chinese. NEVER think in English or any other language. "
+        "Your final responses must also be in Chinese."
     ),
     "en": (
         "Always think and respond in English. "
@@ -116,124 +118,58 @@ RESPONSE_LANGUAGE_INSTRUCTIONS = {
 }
 
 
-def _format_messages_for_summary(messages: list[dict[str, Any]]) -> str:
-    lines: list[str] = []
-    for msg in messages:
-        if not isinstance(msg, dict):
-            continue
-        role = msg.get("role", "unknown")
-        content = extract_text_content(msg.get("content")) or ""
-        if role == "system":
-            lines.append(f"[系统]: {content}")
-        elif role == "user":
-            lines.append(f"[用户]: {content}")
-        elif role == "assistant":
-            tool_calls = msg.get("tool_calls")
-            if isinstance(tool_calls, list) and tool_calls:
-                tc_desc = ", ".join(
-                    str((tc.get("function") or {}).get("name", "?"))
-                    for tc in tool_calls
-                    if isinstance(tc, dict)
-                )
-                lines.append(f"[助手 — 调用了 {tc_desc}]: {content}")
-            else:
-                lines.append(f"[助手]: {content}")
-        elif role == "tool":
-            tool_id = msg.get("tool_call_id", "?")
-            truncated = content[:500] + "..." if len(content) > 500 else content
-            lines.append(f"[工具 {tool_id} 的结果]: {truncated}")
-    return "\n\n".join(lines)
-
-
-def summarize_conversation(
-    messages_to_summarize: list[dict[str, Any]],
-    config: ProxyConfig,
-    authorization: str,
-    upstream_model: str,
-) -> str | None:
-    if not messages_to_summarize:
-        return None
-
-    formatted = _format_messages_for_summary(messages_to_summarize)
-    summary_payload = {
-        "model": upstream_model,
-        "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "你是对话摘要助手。请对以下对话历史生成全面但简洁的摘要。"
-                    "保留所有关键信息：已做决策、编写或修改的代码、发现的错误及修复、"
-                    "技术上下文、用户偏好以及进行中的任务。摘要必须包含足够细节，"
-                    "以便在不丢失上下文的情况下继续对话。"
-                ),
-            },
-            {
-                "role": "user",
-                "content": (
-                    "请摘要以下对话。"
-                    f"务必全面但简洁：\n\n{formatted}"
-                ),
-            },
-        ],
-        "stream": False,
-        "max_tokens": 2000,
-        "thinking": {"type": "disabled"},
-    }
-
-    upstream_url = f"{config.upstream_base_url}/chat/completions"
-    body = json.dumps(
-        summary_payload, ensure_ascii=False, separators=(",", ":")
-    ).encode("utf-8")
-
-    request = urllib.request.Request(
-        upstream_url,
-        data=body,
-        method="POST",
-        headers={
-            "Authorization": authorization,
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        },
-    )
-
-    try:
-        with urllib.request.urlopen(request, timeout=config.request_timeout) as resp:
-            response_body = resp.read()
-            result = json.loads(response_body.decode("utf-8"))
-            choices = result.get("choices", [])
-            if choices and isinstance(choices[0], dict):
-                message = choices[0].get("message", {})
-                summary = message.get("content", "")
-                if summary:
-                    LOG.info(
-                        "已将 %s 条消息摘要为 %s 个字符",
-                        len(messages_to_summarize),
-                        len(summary),
-                    )
-                    return summary.strip()
-    except (HTTPError, URLError, OSError, json.JSONDecodeError) as exc:
-        LOG.warning("对话摘要失败: %s", exc)
-
-    return None
-
-
-def rebuild_messages_with_summary(
+def sanitize_tool_messages(
     messages: list[dict[str, Any]],
-    summary: str,
-    keep_recent: int,
-) -> list[dict[str, Any]]:
-    system_msgs = leading_system_messages(messages)
-    non_system_msgs = messages[len(system_msgs):]
+) -> tuple[list[dict[str, Any]], int]:
+    """Drop tool messages that are not preceded by an assistant with tool_calls."""
+    sanitized: list[dict[str, Any]] = []
+    dropped = 0
+    active_tool_turn = False
+    pending_tool_call_ids: set[str] = set()
+    pending_unidentified_tool_calls = False
 
-    split_index = max(0, len(non_system_msgs) - keep_recent)
-    recent_msgs = non_system_msgs[split_index:]
+    for message in messages:
+        role = message.get("role")
+        if role == "assistant":
+            tool_calls = message.get("tool_calls")
+            if isinstance(tool_calls, list) and tool_calls:
+                active_tool_turn = True
+                pending_tool_call_ids = {
+                    str(tool_call.get("id"))
+                    for tool_call in tool_calls
+                    if isinstance(tool_call, dict) and tool_call.get("id")
+                }
+                pending_unidentified_tool_calls = any(
+                    isinstance(tool_call, dict) and not tool_call.get("id")
+                    for tool_call in tool_calls
+                )
+            else:
+                active_tool_turn = False
+                pending_tool_call_ids = set()
+                pending_unidentified_tool_calls = False
+            sanitized.append(message)
+            continue
 
-    summary_msg = {
-        "role": "system",
-        "content": SUMMARY_SYSTEM_PREFIX + summary,
-    }
+        if role == "tool":
+            tool_call_id = str(message.get("tool_call_id") or "")
+            valid = active_tool_turn and (
+                pending_unidentified_tool_calls
+                or tool_call_id in pending_tool_call_ids
+            )
+            if not valid:
+                dropped += 1
+                continue
+            sanitized.append(message)
+            if tool_call_id in pending_tool_call_ids:
+                pending_tool_call_ids.discard(tool_call_id)
+            continue
 
-    return [*system_msgs, summary_msg, *recent_msgs]
+        active_tool_turn = False
+        pending_tool_call_ids = set()
+        pending_unidentified_tool_calls = False
+        sanitized.append(message)
+
+    return sanitized, dropped
 
 
 @dataclass(frozen=True)
@@ -288,6 +224,20 @@ def extract_text_content(content: Any) -> str | None:
     if isinstance(content, (dict, tuple)):
         return json.dumps(content, ensure_ascii=False, sort_keys=True)
     return str(content)
+
+
+def _has_multimodal_parts(content: list[Any]) -> bool:
+    """检查内容数组中是否包含非文本部分（图片、音频等多模态内容）。
+
+    纯文本部分类型为 "text" 或 "input_text"，可安全合并为字符串。
+    任何其他类型（如 "image_url"）表示多模态内容，应保持数组格式。
+    """
+    for item in content:
+        if isinstance(item, dict):
+            item_type = item.get("type")
+            if item_type and item_type not in ("text", "input_text"):
+                return True
+    return False
 
 
 def strip_cursor_thinking_blocks(content: str) -> str:
@@ -386,7 +336,12 @@ def normalize_message(
         normalized["role"] = "tool"
 
     if "content" in normalized:
-        normalized["content"] = extract_text_content(normalized["content"]) or ""
+        content_val = normalized["content"]
+        if isinstance(content_val, list) and _has_multimodal_parts(content_val):
+            # 多模态内容（包含图片等非文本部分）- 保持数组格式透传
+            normalized["content"] = content_val
+        else:
+            normalized["content"] = extract_text_content(content_val) or ""
     elif normalized["role"] in {"assistant", "tool", "system", "user"}:
         normalized["content"] = ""
     if normalized["role"] == "assistant" and isinstance(normalized.get("content"), str):
@@ -658,11 +613,21 @@ def inject_response_language_instruction(
         return messages
     instruction = RESPONSE_LANGUAGE_INSTRUCTIONS[language]
     leading = leading_system_messages(messages)
+    # 检查是否已有完全相同的指令
     for message in leading:
         if message.get("content") == instruction:
             return messages
+    # 移除旧版本的 RI 语言指令（精确匹配 RI 字典中的值）
+    filtered_leading: list[dict[str, Any]] = []
+    for message in leading:
+        content = message.get("content")
+        if isinstance(content, str) and any(
+            content == ri_instr for ri_instr in RESPONSE_LANGUAGE_INSTRUCTIONS.values()
+        ):
+            continue
+        filtered_leading.append(message)
     rest = messages[len(leading):]
-    return [*leading, {"role": "system", "content": instruction}, *rest]
+    return [*filtered_leading, {"role": "system", "content": instruction}, *rest]
 
 
 def leading_system_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -951,40 +916,6 @@ def prepare_upstream_request(
         authorization,
     )
 
-    raw_messages = payload.get("messages")
-    if (
-        config.summary_enabled
-        and isinstance(raw_messages, list)
-        and len(raw_messages) > config.summary_max_messages
-        and authorization
-    ):
-        keep_recent = max(1, config.summary_keep_recent)
-        messages_to_summarize = raw_messages[: -keep_recent] if keep_recent < len(raw_messages) else raw_messages
-        summary = summarize_conversation(
-            messages_to_summarize,
-            config,
-            authorization,
-            upstream_model,
-        )
-        if summary:
-            if store is not None:
-                cleared = store.clear_namespace(cache_namespace)
-                if cleared:
-                    LOG.info(
-                        "已清除命名空间 %s 的 %s 条 reasoning 缓存条目",
-                        cache_namespace[:12],
-                        cleared,
-                    )
-            payload["messages"] = rebuild_messages_with_summary(
-                raw_messages, summary, keep_recent,
-            )
-            LOG.info(
-                "已重建对话: %s 条消息 -> %s 条消息（摘要 %s 个字符）",
-                len(raw_messages),
-                len(payload["messages"]),
-                len(summary),
-            )
-
     pre_repair_messages, _, _, _ = normalize_messages(
         payload.get("messages"),
         None,
@@ -1052,6 +983,12 @@ def prepare_upstream_request(
         messages,
         config.response_language,
     )
+    messages, dropped_tool_messages = sanitize_tool_messages(messages)
+    if dropped_tool_messages:
+        LOG.warning(
+            "已丢弃 %s 条无有效 tool_calls 前置的 tool 消息",
+            dropped_tool_messages,
+        )
     prepared["messages"] = strip_recovery_notice_for_upstream(messages)
 
     return PreparedRequest(

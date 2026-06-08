@@ -27,6 +27,7 @@ from deepseek_cursor_proxy.transform import (
     prepare_upstream_request,
     reasoning_cache_namespace,
     rewrite_response_body,
+    sanitize_tool_messages,
     strip_cursor_thinking_blocks,
     strip_recovery_notice_for_upstream,
 )
@@ -982,6 +983,35 @@ class StopMidStreamingToolCallTests(unittest.TestCase):
             prepared.payload["messages"][2]["reasoning_content"],
             "Reasoning A.",
         )
+
+
+
+
+class SanitizeToolMessagesTests(unittest.TestCase):
+    def test_drops_orphan_tool_messages(self) -> None:
+        messages = [
+            {"role": "user", "content": "hi"},
+            {"role": "tool", "tool_call_id": "call_1", "content": "orphan"},
+        ]
+        sanitized, dropped = sanitize_tool_messages(messages)
+        self.assertEqual(dropped, 1)
+        self.assertEqual(sanitized, [{"role": "user", "content": "hi"}])
+
+    def test_keeps_tool_messages_after_assistant_tool_calls(self) -> None:
+        tool_call = {
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": "read", "arguments": "{}"},
+        }
+        messages = [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "", "tool_calls": [tool_call]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "ok"},
+            {"role": "user", "content": "next"},
+        ]
+        sanitized, dropped = sanitize_tool_messages(messages)
+        self.assertEqual(dropped, 0)
+        self.assertEqual(len(sanitized), 4)
 
 
 if __name__ == "__main__":
