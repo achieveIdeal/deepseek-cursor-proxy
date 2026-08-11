@@ -21,13 +21,16 @@ from deepseek_cursor_proxy.transform import (
     RECOVERY_NOTICE_CONTENT,
     RECOVERY_NOTICE_TEXT,
     RESPONSE_LANGUAGE_INSTRUCTIONS,
+    build_second_pass_payload,
     extract_text_content,
     inject_response_language_instruction,
+    multimodal_content_fingerprint,
     normalize_reasoning_effort,
     prepare_upstream_request,
     reasoning_cache_namespace,
     rewrite_response_body,
     sanitize_tool_messages,
+    should_route_to_vision,
     strip_cursor_thinking_blocks,
     strip_recovery_notice_for_upstream,
 )
@@ -1078,6 +1081,137 @@ class SanitizeToolMessagesTests(unittest.TestCase):
         sanitized, dropped = sanitize_tool_messages(messages)
         self.assertEqual(dropped, 0)
         self.assertEqual(len(sanitized), 4)
+
+
+class VisionReuseTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.store = ReasoningStore(":memory:")
+        self.image_content = [
+            {"type": "text", "text": "这张图是什么"},
+            {
+                "type": "image_url",
+                "image_url": {"url": "data:image/png;base64,abc123"},
+            },
+        ]
+        self.fingerprint = multimodal_content_fingerprint(self.image_content)
+
+    def tearDown(self) -> None:
+        self.store.close()
+
+    def test_should_route_to_vision_skips_when_ocr_cached(self) -> None:
+        messages = [{"role": "user", "content": self.image_content}]
+        self.assertTrue(should_route_to_vision(messages, self.store))
+        self.store.put_vision_ocr(self.fingerprint, "一只橘猫")
+        self.assertFalse(should_route_to_vision(messages, self.store))
+
+    def test_tool_loop_reuses_cached_ocr_without_vision_routing(self) -> None:
+        self.store.put_vision_ocr(self.fingerprint, "一只橘猫坐在沙发上")
+        config = ProxyConfig(
+            thinking="disabled",
+            vision_enabled=True,
+            vision_api_key="test-key",
+        )
+        payload = {
+            "model": "deepseek-v4-pro",
+            "messages": [
+                {"role": "user", "content": self.image_content},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "read_file",
+                                "arguments": "{}",
+                            },
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": "ok"},
+            ],
+        }
+        prepared = prepare_upstream_request(payload, config, self.store)
+        self.assertFalse(prepared.multimodal_routing)
+        user_messages = [
+            message
+            for message in prepared.payload["messages"]
+            if message.get("role") == "user"
+        ]
+        self.assertTrue(user_messages)
+        user_content = user_messages[0]["content"]
+        self.assertIn("一只橘猫坐在沙发上", user_content)
+        self.assertIn("图片内容已被视觉模型识别", user_content)
+        self.assertNotIn("已由 DeepSeek 文本代理省略", user_content)
+
+    def test_fresh_image_turn_enables_vision_routing(self) -> None:
+        config = ProxyConfig(
+            thinking="disabled",
+            vision_enabled=True,
+            vision_api_key="test-key",
+        )
+        prepared = prepare_upstream_request(
+            {
+                "model": "deepseek-v4-pro",
+                "messages": [{"role": "user", "content": self.image_content}],
+            },
+            config,
+            self.store,
+        )
+        self.assertTrue(prepared.multimodal_routing)
+        self.assertEqual(prepared.vision_ocr_cache_key, self.fingerprint)
+        self.assertTrue(prepared.vision_payload)
+
+    def test_second_pass_keeps_assistant_reasoning(self) -> None:
+        vision_payload = {
+            "model": "GLM-4.6V",
+            "messages": [
+                {"role": "user", "content": self.image_content},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "read_file", "arguments": "{}"},
+                        }
+                    ],
+                },
+            ],
+        }
+        deepseek_payload = {
+            "model": "deepseek-v4-pro",
+            "thinking": {"type": "enabled"},
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "这张图是什么\n[image_url 已由 DeepSeek 文本代理省略]",
+                },
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "reasoning_content": "先读一下文件",
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "read_file", "arguments": "{}"},
+                        }
+                    ],
+                },
+            ],
+        }
+        second = build_second_pass_payload(
+            vision_payload,
+            "一只橘猫",
+            "deepseek-v4-pro",
+            deepseek_payload=deepseek_payload,
+        )
+        self.assertEqual(second["messages"][1]["reasoning_content"], "先读一下文件")
+        self.assertIn("一只橘猫", second["messages"][0]["content"])
+        self.assertNotIn("已由 DeepSeek 文本代理省略", second["messages"][0]["content"])
 
 
 if __name__ == "__main__":

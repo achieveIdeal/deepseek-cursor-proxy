@@ -215,6 +215,15 @@ class ReasoningStore:
             )
             """
         )
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS vision_ocr_cache (
+                key TEXT PRIMARY KEY,
+                ocr_text TEXT NOT NULL,
+                created_at REAL NOT NULL
+            )
+            """
+        )
 
         # 为 key_reversed 列做兼容迁移（旧版本数据库无此列）
         columns = {
@@ -246,6 +255,10 @@ class ReasoningStore:
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_rc_key_reversed "
             "ON reasoning_cache(key_reversed)"
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_voc_created_at "
+            "ON vision_ocr_cache(created_at)"
         )
         self._conn.commit()
 
@@ -527,6 +540,72 @@ class ReasoningStore:
         self._batch_put(items)
         return len(keys)
 
+    def put_vision_ocr(self, key: str, ocr_text: str) -> None:
+        """缓存图片识别文本，供多轮对话/工具循环复用，避免重复调用视觉 API。"""
+        if not key or not isinstance(ocr_text, str) or not ocr_text:
+            return
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO vision_ocr_cache (key, ocr_text, created_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    ocr_text = excluded.ocr_text,
+                    created_at = excluded.created_at
+                """,
+                (key, ocr_text, time.time()),
+            )
+            self._prune_vision_ocr_locked()
+            self._conn.commit()
+
+    def get_vision_ocr(self, key: str) -> str | None:
+        if not key:
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT ocr_text FROM vision_ocr_cache WHERE key = ?",
+                (key,),
+            ).fetchone()
+            if row is None:
+                return None
+            self._conn.execute(
+                "UPDATE vision_ocr_cache SET created_at = ? WHERE key = ?",
+                (time.time(), key),
+            )
+            self._conn.commit()
+            return str(row[0])
+
+    def _prune_vision_ocr_locked(self) -> int:
+        deleted = 0
+        if self.max_age_seconds is not None and self.max_age_seconds > 0:
+            cutoff = time.time() - self.max_age_seconds
+            cursor = self._conn.execute(
+                "DELETE FROM vision_ocr_cache WHERE created_at < ?",
+                (cutoff,),
+            )
+            deleted += cursor.rowcount if cursor.rowcount != -1 else 0
+        if self.max_rows is not None and self.max_rows > 0:
+            row = self._conn.execute(
+                "SELECT COUNT(*) FROM vision_ocr_cache"
+            ).fetchone()
+            count = int(row[0] if row else 0)
+            overflow = count - self.max_rows
+            if overflow > 0:
+                cursor = self._conn.execute(
+                    """
+                    DELETE FROM vision_ocr_cache
+                    WHERE key IN (
+                        SELECT key
+                        FROM vision_ocr_cache
+                        ORDER BY created_at ASC, rowid ASC
+                        LIMIT ?
+                    )
+                    """,
+                    (overflow,),
+                )
+                deleted += cursor.rowcount if cursor.rowcount != -1 else 0
+        return deleted
+
     def clear(self) -> int:
         with self._lock:
             row = self._conn.execute(
@@ -534,6 +613,7 @@ class ReasoningStore:
             ).fetchone()
             count = int(row[0] if row else 0)
             self._conn.execute("DELETE FROM reasoning_cache")
+            self._conn.execute("DELETE FROM vision_ocr_cache")
             self._approx_row_count = 0
             self._pending_touches.clear()
             self._conn.commit()
@@ -554,6 +634,7 @@ class ReasoningStore:
     def prune(self) -> int:
         with self._lock:
             deleted = self._prune_locked()
+            deleted += self._prune_vision_ocr_locked()
             self._conn.commit()
         return deleted
 

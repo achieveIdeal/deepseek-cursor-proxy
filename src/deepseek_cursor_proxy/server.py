@@ -33,6 +33,7 @@ from .tunnel import NgrokTunnel, local_tunnel_target
 from .transform import (
     RECOVERY_NOTICE_CONTENT,
     build_second_pass_payload,
+    cache_vision_ocr_from_messages,
     extract_assistant_text_from_response,
     prepare_upstream_request,
     rewrite_response_body,
@@ -668,12 +669,25 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                 len(first_pass_text),
             )
 
+        # 缓存 OCR，供后续工具循环/多轮对话复用，避免每次重新识别
+        cached = cache_vision_ocr_from_messages(
+            self.reasoning_store,
+            prepared.vision_payload.get("messages")
+            if isinstance(prepared.vision_payload, dict)
+            else None,
+            first_pass_text,
+            preferred_key=getattr(prepared, "vision_ocr_cache_key", "") or "",
+        )
+        if self.config.verbose:
+            LOG.info("已缓存图片识别结果 entries=%s", cached)
+
         # 构建第二遍请求（DeepSeek 推理）
-        # 使用 vision_payload（含原始多模态消息）作为模板，替换图片为视觉 API 返回的文本描述
+        # 以已修复 reasoning 的 DeepSeek 请求体为骨架，仅替换图片相关 content
         second_pass_payload = build_second_pass_payload(
             prepared.vision_payload,
             first_pass_text,
             prepared.second_pass_model,
+            deepseek_payload=prepared.payload,
         )
 
         # 保留原始 stream 设置
@@ -688,7 +702,7 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
             stream_options["include_usage"] = True
             second_pass_payload["stream_options"] = stream_options
 
-        # 恢复 DeepSeek 专用字段（第一遍 vision_payload 中已剥离）
+        # 确保 DeepSeek 专用字段存在
         for _deepseek_field in ("thinking", "reasoning_effort"):
             if _deepseek_field in prepared.payload:
                 second_pass_payload[_deepseek_field] = prepared.payload[_deepseek_field]

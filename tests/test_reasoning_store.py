@@ -128,6 +128,17 @@ class ReasoningStoreTests(unittest.TestCase):
         finally:
             store.close()
 
+    def test_vision_ocr_cache_roundtrip(self) -> None:
+        store = ReasoningStore(":memory:")
+        try:
+            store.put_vision_ocr("img-a", "a cat on a sofa")
+            self.assertEqual(store.get_vision_ocr("img-a"), "a cat on a sofa")
+            self.assertIsNone(store.get_vision_ocr("img-missing"))
+            store.put_vision_ocr("img-a", "updated description")
+            self.assertEqual(store.get_vision_ocr("img-a"), "updated description")
+        finally:
+            store.close()
+
 
 if __name__ == "__main__":
     unittest.main()
