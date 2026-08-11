@@ -12,7 +12,7 @@ import time
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
-from urllib.request import Request, urlopen
+from urllib.request import Request
 import zlib
 
 from .config import (
@@ -20,6 +20,7 @@ from .config import (
     default_config_path,
     default_reasoning_content_path,
 )
+from .http_util import upstream_urlopen
 from .logging import (
     LOG,
     TerminalSpinner,
@@ -31,6 +32,8 @@ from .trace import TraceRequest, TraceWriter
 from .tunnel import NgrokTunnel, local_tunnel_target
 from .transform import (
     RECOVERY_NOTICE_CONTENT,
+    build_second_pass_payload,
+    extract_assistant_text_from_response,
     prepare_upstream_request,
     rewrite_response_body,
 )
@@ -214,14 +217,42 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
         if self.config.verbose:
             log_json("上游请求体", prepared.payload)
 
-        upstream_body = json.dumps(
-            prepared.payload, ensure_ascii=False, separators=(",", ":")
-        ).encode("utf-8")
-        upstream_url = f"{self.config.upstream_base_url}/chat/completions"
-        upstream_headers = self._upstream_headers(
-            stream=bool(prepared.payload.get("stream")),
-            authorization=cursor_authorization,
-        )
+        # 构建上游请求体
+        upward_stream = bool(prepared.payload.get("stream"))
+        if prepared.multimodal_routing and prepared.vision_payload:
+            # 多模态第一遍：发送给视觉 API（如智谱 GLM）
+            first_pass_payload = dict(prepared.vision_payload)
+            first_pass_payload["stream"] = False
+            upstream_body = json.dumps(
+                first_pass_payload, ensure_ascii=False, separators=(",", ":")
+            ).encode("utf-8")
+            upstream_url = (
+                f"{self.config.vision_base_url}/chat/completions"
+            )
+            first_pass_stream = False
+            # 视觉 API 使用自己的 API Key
+            vision_auth = f"Bearer {self.config.vision_api_key}"
+            upstream_headers = self._upstream_headers(
+                stream=False,
+                authorization=vision_auth,
+            )
+            if self.config.verbose:
+                LOG.info(
+                    "多模态第一遍 → 视觉 API vision_url=%s model=%s",
+                    upstream_url,
+                    first_pass_payload.get("model"),
+                )
+        else:
+            first_pass_payload = dict(prepared.payload)
+            upstream_body = json.dumps(
+                first_pass_payload, ensure_ascii=False, separators=(",", ":")
+            ).encode("utf-8")
+            upstream_url = f"{self.config.upstream_base_url}/chat/completions"
+            first_pass_stream = upward_stream
+            upstream_headers = self._upstream_headers(
+                stream=first_pass_stream,
+                authorization=cursor_authorization,
+            )
         if trace is not None:
             trace.record_upstream_request(
                 url=upstream_url,
@@ -238,20 +269,22 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
         if self.config.verbose:
             log_send_summary(prepared)
         spinner = TerminalSpinner(
-            enabled=bool(prepared.payload.get("stream")) and not self.config.verbose,
+            enabled=upward_stream and not self.config.verbose,
             text="└ {frame}",
         ).start()
 
         try:
             if self.config.verbose:
                 LOG.info("正在转发到 %s", upstream_url)
-            response = urlopen(request, timeout=self.config.request_timeout)
+            response = upstream_urlopen(
+                request, timeout=self.config.request_timeout
+            )
         except HTTPError as exc:
             spinner.stop()
             LOG.warning(
                 "请求失败 upstream_status=%s stream=%s elapsed_ms=%s",
                 exc.code,
-                bool(prepared.payload.get("stream")),
+                upward_stream,
                 elapsed_ms(started),
             )
             self._send_upstream_error(exc, trace=trace)
@@ -259,7 +292,7 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                 trace,
                 "upstream_error",
                 http_status=exc.code,
-                stream=bool(prepared.payload.get("stream")),
+                stream=upward_stream,
             )
             return
         except URLError as exc:
@@ -287,10 +320,20 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                     LOG.info(
                         "上游响应 status=%s stream=%s elapsed_ms=%s",
                         upstream_status,
-                        bool(prepared.payload.get("stream")),
+                        upward_stream,
                         elapsed_ms(started),
                     )
-                if prepared.payload.get("stream"):
+
+                # ── 多模态两步管道 ──
+                if prepared.multimodal_routing:
+                    sent_response = self._handle_multimodal_two_pass(
+                        response,
+                        prepared,
+                        cursor_authorization,
+                        started,
+                        trace,
+                    )
+                elif upward_stream:
                     sent_response = self._proxy_streaming_response(
                         response,
                         prepared.original_model,
@@ -320,7 +363,7 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                         trace,
                         "client_disconnected",
                         http_status=upstream_status,
-                        stream=bool(prepared.payload.get("stream")),
+                        stream=upward_stream,
                     )
                     return
                 spinner.stop()
@@ -329,7 +372,7 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                     trace,
                     "completed",
                     http_status=upstream_status,
-                    stream=bool(prepared.payload.get("stream")),
+                    stream=upward_stream,
                 )
         finally:
             spinner.stop()
@@ -557,6 +600,194 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
         )
         if sent_headers:
             self._write_to_client(body, "发送上游错误响应体")
+
+    # ── 多模态两步管道 ──
+
+    def _handle_multimodal_two_pass(
+        self,
+        first_response: Any,
+        prepared: Any,
+        cursor_authorization: str,
+        started: float,
+        trace: TraceRequest | None = None,
+    ) -> ProxyResponseResult:
+        """两步管道：先视觉 API 识别图片 → 文本，再回传文本给 DeepSeek 推理。
+
+        第一遍始终以非流式模式请求，确保拿到完整文本。
+        第二遍使用原始请求的 stream 设置。
+        """
+        # 读取第一遍响应（视觉 API）
+        first_body = read_response_body(first_response)
+        if self.config.verbose:
+            LOG.info(
+                "多模态第一遍响应（%s）已收到",
+                self.config.vision_model,
+            )
+            log_bytes("第一遍响应体", first_body)
+
+        try:
+            first_payload = json.loads(first_body.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            LOG.warning("解析第一遍 JSON 响应失败: %s", exc)
+            self._send_json(
+                502,
+                {"error": {"message": f"多模态第一遍响应解析失败: {exc}"}},
+                trace=trace,
+            )
+            self._finish_trace(trace, "upstream_error", http_status=502)
+            return ProxyResponseResult(False)
+
+        # 提取视觉 API 返回的文本内容
+        first_pass_text = extract_assistant_text_from_response(first_payload)
+        if not first_pass_text:
+            LOG.warning("多模态第一遍响应中没有文本内容")
+            # 如果第一遍没有文本（异常情况），直接返回第一遍响应
+            body = json.dumps(
+                first_payload, ensure_ascii=False, separators=(",", ":")
+            ).encode("utf-8")
+            headers = {
+                "Content-Type": "application/json",
+                "Content-Length": str(len(body)),
+            }
+            sent_headers = self._send_response_headers(
+                200,
+                [
+                    ("Content-Type", headers["Content-Type"]),
+                    ("Content-Length", headers["Content-Length"]),
+                ],
+                "发送多模态响应头（无文本回退）",
+            )
+            if sent_headers:
+                self._write_to_client(body, "发送多模态响应体（无文本回退）")
+            usage = first_payload.get("usage") if isinstance(first_payload, dict) else None
+            return ProxyResponseResult(sent_headers, usage if isinstance(usage, dict) else None)
+
+        if self.config.verbose:
+            LOG.info(
+                "多模态第一遍提取文本长度=%s",
+                len(first_pass_text),
+            )
+
+        # 构建第二遍请求（DeepSeek 推理）
+        # 使用 vision_payload（含原始多模态消息）作为模板，替换图片为视觉 API 返回的文本描述
+        second_pass_payload = build_second_pass_payload(
+            prepared.vision_payload,
+            first_pass_text,
+            prepared.second_pass_model,
+        )
+
+        # 保留原始 stream 设置
+        original_stream = bool(prepared.payload.get("stream"))
+        second_pass_payload["stream"] = original_stream
+        if original_stream:
+            stream_options = second_pass_payload.get("stream_options")
+            if not isinstance(stream_options, dict):
+                stream_options = {}
+            else:
+                stream_options = dict(stream_options)
+            stream_options["include_usage"] = True
+            second_pass_payload["stream_options"] = stream_options
+
+        # 恢复 DeepSeek 专用字段（第一遍 vision_payload 中已剥离）
+        for _deepseek_field in ("thinking", "reasoning_effort"):
+            if _deepseek_field in prepared.payload:
+                second_pass_payload[_deepseek_field] = prepared.payload[_deepseek_field]
+
+        if self.config.verbose:
+            LOG.info(
+                "多模态第二遍请求 model=%s stream=%s",
+                prepared.second_pass_model,
+                original_stream,
+            )
+
+        # 发送第二遍请求
+        second_body = json.dumps(
+            second_pass_payload, ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8")
+        second_url = f"{self.config.upstream_base_url}/chat/completions"
+        second_headers = self._upstream_headers(
+            stream=original_stream,
+            authorization=cursor_authorization,
+        )
+
+        if trace is not None:
+            trace.record_upstream_request(
+                url=second_url,
+                headers=second_headers,
+                body_bytes=second_body,
+            )
+
+        second_request = Request(
+            second_url,
+            data=second_body,
+            method="POST",
+            headers=second_headers,
+        )
+
+        try:
+            second_response = upstream_urlopen(
+                second_request, timeout=self.config.request_timeout
+            )
+        except HTTPError as exc:
+            LOG.warning(
+                "多模态第二遍请求失败 upstream_status=%s",
+                exc.code,
+            )
+            self._send_upstream_error(exc, trace=trace)
+            self._finish_trace(
+                trace,
+                "upstream_error",
+                http_status=exc.code,
+                stream=original_stream,
+            )
+            return ProxyResponseResult(False)
+        except URLError as exc:
+            LOG.warning(
+                "多模态第二遍上游请求失败 reason=%s",
+                exc.reason,
+            )
+            self._send_json(
+                502,
+                {"error": {"message": f"上游请求失败: {exc.reason}"}},
+                trace=trace,
+            )
+            self._finish_trace(trace, "upstream_error", http_status=502)
+            return ProxyResponseResult(False)
+
+        with second_response:
+            second_status = getattr(second_response, "status", 200)
+            if self.config.verbose:
+                LOG.info(
+                    "多模态第二遍响应 status=%s stream=%s elapsed_ms=%s",
+                    second_status,
+                    original_stream,
+                    elapsed_ms(started),
+                )
+
+            if original_stream:
+                return self._proxy_streaming_response(
+                    second_response,
+                    prepared.original_model,
+                    second_pass_payload["messages"],
+                    prepared.cache_namespace,
+                    prepared.recovery_notice,
+                    trace=trace,
+                    record_response_scope=prepared.record_response_scope,
+                    record_response_messages=prepared.record_response_messages,
+                    record_response_contexts=prepared.record_response_contexts,
+                )
+            else:
+                return self._proxy_regular_response(
+                    second_response,
+                    prepared.original_model,
+                    second_pass_payload["messages"],
+                    prepared.cache_namespace,
+                    prepared.recovery_notice,
+                    trace=trace,
+                    record_response_scope=prepared.record_response_scope,
+                    record_response_messages=prepared.record_response_messages,
+                    record_response_contexts=prepared.record_response_contexts,
+                )
 
     def _proxy_regular_response(
         self,

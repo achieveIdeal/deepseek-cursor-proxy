@@ -874,6 +874,72 @@ class StopMidStreamingToolCallTests(unittest.TestCase):
             "Need to grep.",
         )
 
+    def test_tool_call_id_fallback_survives_history_prefix_rewrite(self) -> None:
+        """Cursor rewriting early system/user text changes the conversation
+        scope hash. Without suffix fallback the proxy would miss the cache and
+        emit the '已刷新 reasoning_content 历史记录' recovery notice."""
+        original_prior = [
+            {"role": "system", "content": "Original system prompt."},
+            {"role": "user", "content": "inspect the repo"},
+        ]
+        rewritten_prior = [
+            {"role": "system", "content": "Compacted system prompt + rules."},
+            {
+                "role": "user",
+                "content": "[summarized earlier turns]\n\ninspect the repo",
+            },
+        ]
+        tool_call = {
+            "id": "call_history_rewrite",
+            "type": "function",
+            "function": {"name": "Shell", "arguments": '{"command":"git status"}'},
+        }
+        assistant = {
+            "role": "assistant",
+            "content": "",
+            "reasoning_content": "Need git status before editing.",
+            "tool_calls": [tool_call],
+        }
+        # Store only under the original scope — portable turn keys also miss
+        # because the rewritten user message changes turn_context_signature.
+        self.store.store_assistant_message(
+            assistant,
+            conversation_scope(original_prior, _default_cache_namespace()),
+        )
+
+        prepared = prepare_upstream_request(
+            {
+                "model": "deepseek-v4-pro",
+                "messages": [
+                    *rewritten_prior,
+                    {"role": "assistant", "content": "", "tool_calls": [tool_call]},
+                    {
+                        "role": "tool",
+                        "tool_call_id": "call_history_rewrite",
+                        "content": "clean",
+                    },
+                ],
+            },
+            ProxyConfig(
+                missing_reasoning_strategy="recover",
+                response_language=None,
+            ),
+            self.store,
+        )
+
+        self.assertEqual(prepared.patched_reasoning_messages, 1)
+        self.assertEqual(prepared.missing_reasoning_messages, 0)
+        self.assertIsNone(prepared.recovery_notice)
+        self.assertEqual(prepared.recovered_reasoning_messages, 0)
+        self.assertEqual(
+            prepared.payload["messages"][2]["reasoning_content"],
+            "Need git status before editing.",
+        )
+        self.assertEqual(
+            prepared.reasoning_diagnostics[0]["hit_kind"],
+            "tool_call_id_fallback",
+        )
+
     def test_tool_name_keys_are_isolated_across_distinct_turns(self) -> None:
         # Two separate turns each interrupt with the same function name.
         # The strict scope already differs (each turn has more prior

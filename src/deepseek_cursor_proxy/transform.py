@@ -46,6 +46,10 @@ SUPPORTED_REQUEST_FIELDS = {
     "logit_bias",
 }
 
+# 多模态视觉模型配置（通过第三方视觉 API 实现图片识别，默认智谱 GLM）
+# deepseek-chat 是文本模型，不支持图片；视觉处理通过外部 API 完成
+MULTIMODAL_MODEL = "deepseek-chat"  # 保留兼容，已不再用于视觉路由
+
 MESSAGE_FIELDS = {
     "role",
     "content",
@@ -192,6 +196,11 @@ class PreparedRequest:
     recovery_steps: list[dict[str, Any]] = field(default_factory=list)
     continued_recovery_boundary: bool = False
     retired_prefix_messages: int = 0
+    # 多模态路由：当请求包含图片时，先发送到视觉 API 识别，再回传文本给 DeepSeek
+    multimodal_routing: bool = False
+    second_pass_model: str = ""
+    # 第一遍请求体（发送给视觉 API），保留原始图片数组
+    vision_payload: dict[str, Any] = field(default_factory=dict)
 
 
 def normalize_reasoning_effort(value: Any) -> str:
@@ -237,6 +246,35 @@ def _has_multimodal_parts(content: list[Any]) -> bool:
             item_type = item.get("type")
             if item_type and item_type not in ("text", "input_text"):
                 return True
+    return False
+
+
+def messages_contain_multimodal(messages: list[dict[str, Any]]) -> bool:
+    """检查消息列表中是否包含多模态内容（如图片）。"""
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if isinstance(content, list) and _has_multimodal_parts(content):
+            return True
+    return False
+
+
+def latest_user_message_has_multimodal(messages: list[dict[str, Any]]) -> bool:
+    """仅检查最新一条用户消息是否包含多模态内容（如图片）。
+
+    与 messages_contain_multimodal 不同，此函数只检查最后一轮用户输入，
+    避免因历史消息中残留的图片而重复触发视觉管道。
+    """
+    for message in reversed(messages):
+        if not isinstance(message, dict):
+            continue
+        if message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if isinstance(content, list) and _has_multimodal_parts(content):
+            return True
+        return False
     return False
 
 
@@ -325,6 +363,7 @@ def normalize_message(
     cache_namespace: str,
     repair_reasoning: bool,
     keep_reasoning: bool,
+    preserve_multimodal: bool = False,
 ) -> tuple[dict[str, Any], bool, bool, dict[str, Any] | None]:
     if not isinstance(message, dict):
         message = {"role": "user", "content": str(message)}
@@ -337,10 +376,13 @@ def normalize_message(
 
     if "content" in normalized:
         content_val = normalized["content"]
-        if isinstance(content_val, list) and _has_multimodal_parts(content_val):
-            # 多模态内容（包含图片等非文本部分）- 保持数组格式透传
+        if preserve_multimodal and isinstance(content_val, list) and _has_multimodal_parts(content_val):
+            # 多模态路由模式：保留数组格式（含 image_url），发送给视觉 API
             normalized["content"] = content_val
         else:
+            # DeepSeek 官方 API 不支持多模态/视觉输入，
+            # image_url 等内容类型会被上游以 400 拒绝。转换为纯文本：
+            # 文本部分直接提取，非文本部分（图片等）替换为占位符提示。
             normalized["content"] = extract_text_content(content_val) or ""
     elif normalized["role"] in {"assistant", "tool", "system", "user"}:
         normalized["content"] = ""
@@ -394,6 +436,64 @@ def normalize_message(
                                     prior_messages,
                                 )
                             break
+                    if not patched:
+                        for tool_call_id in tool_call_ids(normalized):
+                            restored = store.get_by_tool_call_id(tool_call_id)
+                            if restored is not None:
+                                hit_kind = "tool_call_id_fallback"
+                                normalized["reasoning_content"] = restored
+                                patched = True
+                                store.backfill_portable_aliases(
+                                    normalized,
+                                    restored,
+                                    cache_namespace,
+                                    prior_messages,
+                                )
+                                # Also re-index under the current conversation scope
+                                # so subsequent turns hit the fast path.
+                                store.store_assistant_message(
+                                    normalized,
+                                    lookup_scope,
+                                    cache_namespace,
+                                    prior_messages,
+                                )
+                                lookup_keys.append(
+                                    {
+                                        "kind": "tool_call_id_fallback",
+                                        "tool_call_id": tool_call_id,
+                                        "key": f"*:tool_call:{tool_call_id}",
+                                        "portable": True,
+                                        "hit": True,
+                                    }
+                                )
+                                break
+                    if not patched:
+                        signature = message_signature(normalized)
+                        restored = store.get_by_message_signature(signature)
+                        if restored is not None:
+                            hit_kind = "message_signature_fallback"
+                            normalized["reasoning_content"] = restored
+                            patched = True
+                            store.backfill_portable_aliases(
+                                normalized,
+                                restored,
+                                cache_namespace,
+                                prior_messages,
+                            )
+                            store.store_assistant_message(
+                                normalized,
+                                lookup_scope,
+                                cache_namespace,
+                                prior_messages,
+                            )
+                            lookup_keys.append(
+                                {
+                                    "kind": "message_signature_fallback",
+                                    "key": f"*:signature:{signature}",
+                                    "portable": True,
+                                    "hit": True,
+                                }
+                            )
                 if needs_reasoning and not patched:
                     missing = True
                 if needs_reasoning:
@@ -548,6 +648,7 @@ def normalize_messages(
     cache_namespace: str,
     repair_reasoning: bool,
     keep_reasoning: bool,
+    preserve_multimodal: bool = False,
 ) -> tuple[list[dict[str, Any]], int, list[int], list[dict[str, Any]]]:
     if not isinstance(messages, list):
         return [], 0, [], []
@@ -563,6 +664,7 @@ def normalize_messages(
             cache_namespace,
             repair_reasoning,
             keep_reasoning,
+            preserve_multimodal=preserve_multimodal,
         )
         normalized_messages.append(normalized)
         if patched:
@@ -856,6 +958,40 @@ def prepare_upstream_request(
     original_model = str(payload.get("model") or config.upstream_model)
     upstream_model = upstream_model_for(original_model, config)
 
+    # ── 多模态路由检测 ──
+    # 当启用视觉功能（vision_enabled + vision_api_key）且消息包含图片时，
+    # 第一遍发送到配置的视觉 API（如智谱 GLM）识别图片为文本，
+    # 第二遍将文本回传给 DeepSeek 进行推理。
+    multimodal_routing = False
+    second_pass_model = ""
+    vision_payload: dict[str, Any] = {}
+    raw_messages = payload.get("messages")
+    has_multimodal = (
+        isinstance(raw_messages, list)
+        and latest_user_message_has_multimodal(raw_messages)
+    )
+    vision_available = (
+        config.vision_enabled
+        and bool(config.vision_api_key.strip())
+    )
+
+    if has_multimodal and vision_available:
+        LOG.info(
+            "检测到多模态内容，启用视觉管道: vision_model=%s deepseek_model=%s",
+            config.vision_model,
+            upstream_model,
+        )
+        multimodal_routing = True
+        second_pass_model = upstream_model
+        # 构建第一遍视觉请求体
+        vision_payload = _build_vision_payload(payload, config)
+    elif has_multimodal:
+        LOG.info(
+            "检测到多模态内容（图片等），视觉功能未启用，"
+            "已转换为文本占位符（设置 vision_enabled=true 并配置 vision_api_key 可启用图片识别）"
+        )
+
+    # ── 构建 DeepSeek 请求体（第二遍或唯一请求）──
     prepared = {
         key: value for key, value in payload.items() if key in SUPPORTED_REQUEST_FIELDS
     }
@@ -1008,6 +1144,9 @@ def prepare_upstream_request(
         recovery_steps=recovery_steps,
         continued_recovery_boundary=continued_recovery_boundary,
         retired_prefix_messages=retired_prefix_messages,
+        multimodal_routing=multimodal_routing,
+        second_pass_model=second_pass_model,
+        vision_payload=vision_payload,
     )
 
 
@@ -1100,3 +1239,156 @@ def prefix_response_content(response_payload: dict[str, Any], prefix: str) -> bo
         message["content"] = prefix + (content if isinstance(content, str) else "")
         return True
     return False
+
+
+# ---------------------------------------------------------------------------
+# 多模态两步管道：视觉 API（如智谱 GLM）→ DeepSeek（推理）
+# 第一遍：视觉 API 识别图片 → 文本
+# 第二遍：DeepSeek 基于文本进行推理
+# ---------------------------------------------------------------------------
+
+# 视觉 API 不需要的 DeepSeek 专用字段
+_VISION_STRIP_FIELDS = {"thinking", "reasoning_effort", "stream_options"}
+
+
+def _build_vision_payload(
+    payload: dict[str, Any],
+    config: "ProxyConfig",
+) -> dict[str, Any]:
+    """构建发送给视觉 API（如智谱 GLM）的第一遍请求体。
+
+    保留原始多模态消息（含 image_url 数组），
+    剥离 DeepSeek 专用字段（thinking 等），强制非流式。
+    """
+    vision = {
+        key: value
+        for key, value in payload.items()
+        if key in SUPPORTED_REQUEST_FIELDS and key not in _VISION_STRIP_FIELDS
+    }
+    vision["model"] = config.vision_model
+    vision["stream"] = False  # 第一遍必须非流式以获取完整文本
+
+    # 规范化消息，保留多模态内容（图片数组)
+    raw_messages = payload.get("messages")
+    if isinstance(raw_messages, list):
+        normalized, _, _, _ = normalize_messages(
+            raw_messages,
+            None,
+            "",
+            repair_reasoning=False,
+            keep_reasoning=False,
+            preserve_multimodal=True,
+        )
+        # 注入语言指令
+        normalized = inject_response_language_instruction(
+            normalized,
+            config.response_language,
+        )
+        normalized, dropped = sanitize_tool_messages(normalized)
+        if dropped:
+            LOG.warning(
+                "视觉请求已丢弃 %s 条无有效 tool_calls 前置的 tool 消息",
+                dropped,
+            )
+        vision["messages"] = strip_recovery_notice_for_upstream(normalized)
+
+    # 清理可能残留的 DeepSeek 字段
+    vision.pop("thinking", None)
+    vision.pop("reasoning_effort", None)
+    vision.pop("stream_options", None)
+
+    return vision
+
+
+def extract_assistant_text_from_response(
+    response_payload: dict[str, Any],
+) -> str:
+    """从 DeepSeek chat completion 响应中提取助手文本内容。"""
+    choices = response_payload.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return ""
+    choice = choices[0]
+    if not isinstance(choice, dict):
+        return ""
+    message = choice.get("message")
+    if not isinstance(message, dict):
+        return ""
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict):
+                t = item.get("type")
+                text = item.get("text") or item.get("content")
+                if t in ("text", "input_text") and isinstance(text, str):
+                    parts.append(text)
+                elif isinstance(text, str):
+                    parts.append(text)
+            elif isinstance(item, str):
+                parts.append(item)
+        return "\n".join(parts)
+    return str(content) if content else ""
+
+
+def build_second_pass_payload(
+    first_pass_payload: dict[str, Any],
+    first_pass_response_text: str,
+    second_pass_model: str,
+) -> dict[str, Any]:
+    """构建第二遍请求：将多模态内容替换为 deepseek-chat 的识别文本，
+    然后发送给原模型（如 deepseek-v4-pro）进行推理。
+
+    策略：在包含多模态内容的消息中，将图片部分替换为
+    deepseek-chat 返回的文本描述，保留原始文本部分。
+    """
+    second_pass = dict(first_pass_payload)
+    second_pass["model"] = second_pass_model
+
+    messages = second_pass.get("messages")
+    if not isinstance(messages, list):
+        return second_pass
+
+    replaced_messages: list[dict[str, Any]] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            replaced_messages.append(message)
+            continue
+        content = message.get("content")
+        if not isinstance(content, list) or not _has_multimodal_parts(content):
+            replaced_messages.append(message)
+            continue
+
+        # 提取原始文本部分
+        text_parts: list[str] = []
+        for item in content:
+            if isinstance(item, dict):
+                t = item.get("type")
+                text = item.get("text") or item.get("content")
+                if t in ("text", "input_text") and isinstance(text, str):
+                    text_parts.append(text)
+                elif isinstance(text, str) and not t:
+                    text_parts.append(text)
+
+        original_text = "\n".join(text_parts).strip()
+
+        # 构建替换后的文本内容
+        if original_text:
+            new_content = (
+                f"{original_text}\n\n"
+                f"[图片内容已被 deepseek-chat 多模态模型识别，"
+                f"识别结果如下：]\n\n{first_pass_response_text}"
+            )
+        else:
+            new_content = (
+                f"[图片内容已被 deepseek-chat 多模态模型识别，"
+                f"识别结果如下：]\n\n{first_pass_response_text}"
+            )
+
+        new_message = dict(message)
+        new_message["content"] = new_content
+        replaced_messages.append(new_message)
+
+    second_pass["messages"] = replaced_messages
+    return second_pass
