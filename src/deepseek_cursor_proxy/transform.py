@@ -46,10 +46,6 @@ SUPPORTED_REQUEST_FIELDS = {
     "logit_bias",
 }
 
-# 多模态视觉模型配置（通过第三方视觉 API 实现图片识别，默认智谱 GLM）
-# deepseek-chat 是文本模型，不支持图片；视觉处理通过外部 API 完成
-MULTIMODAL_MODEL = "deepseek-chat"  # 保留兼容，已不再用于视觉路由
-
 MESSAGE_FIELDS = {
     "role",
     "content",
@@ -196,13 +192,6 @@ class PreparedRequest:
     recovery_steps: list[dict[str, Any]] = field(default_factory=list)
     continued_recovery_boundary: bool = False
     retired_prefix_messages: int = 0
-    # 多模态路由：当请求包含图片时，先发送到视觉 API 识别，再回传文本给 DeepSeek
-    multimodal_routing: bool = False
-    second_pass_model: str = ""
-    # 第一遍请求体（发送给视觉 API），保留原始图片数组
-    vision_payload: dict[str, Any] = field(default_factory=dict)
-    # 最新用户图片指纹，用于缓存/复用 OCR 结果
-    vision_ocr_cache_key: str = ""
 
 
 def normalize_reasoning_effort(value: Any) -> str:
@@ -240,8 +229,9 @@ def extract_text_content(content: Any) -> str | None:
 def _has_multimodal_parts(content: list[Any]) -> bool:
     """检查内容数组中是否包含非文本部分（图片、音频等多模态内容）。
 
-    纯文本部分类型为 "text" 或 "input_text"，可安全合并为字符串。
-    任何其他类型（如 "image_url"）表示多模态内容，应保持数组格式。
+    纯文本部分类型为 "text" 或 "input_text"，可安全合并为字符串；
+    任何其他类型（如 "image_url"）都只能被丢弃为文本占位符，
+    DeepSeek 上游不接受这类内容。
     """
     for item in content:
         if isinstance(item, dict):
@@ -251,83 +241,8 @@ def _has_multimodal_parts(content: list[Any]) -> bool:
     return False
 
 
-def multimodal_content_fingerprint(content: list[Any]) -> str:
-    """为多模态内容中的非文本部分生成稳定指纹，用作 OCR 缓存键。"""
-    parts: list[Any] = []
-    for item in content:
-        if not isinstance(item, dict):
-            continue
-        item_type = item.get("type")
-        if item_type and item_type not in ("text", "input_text"):
-            parts.append(item)
-    if not parts:
-        return ""
-    canonical = json.dumps(
-        parts, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-    )
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-
-
-def format_vision_ocr_content(
-    original_text: str,
-    ocr_text: str,
-) -> str:
-    """将用户原文与图片识别结果拼成 DeepSeek 可用的纯文本。"""
-    original_text = (original_text or "").strip()
-    ocr_text = (ocr_text or "").strip()
-    if original_text:
-        return (
-            f"{original_text}\n\n"
-            f"[图片内容已被视觉模型识别，识别结果如下：]\n\n{ocr_text}"
-        )
-    return f"[图片内容已被视觉模型识别，识别结果如下：]\n\n{ocr_text}"
-
-
-def extract_text_with_vision_ocr(
-    content: Any,
-    store: ReasoningStore | None,
-) -> str | None:
-    """提取文本；若有缓存的图片识别结果则注入，否则退回占位符。"""
-    if not isinstance(content, list) or not _has_multimodal_parts(content):
-        return extract_text_content(content)
-
-    text_parts: list[str] = []
-    for item in content:
-        if isinstance(item, dict):
-            item_type = item.get("type")
-            text = item.get("text") or item.get("content")
-            if item_type in {"text", "input_text"} and isinstance(text, str):
-                text_parts.append(text)
-            elif isinstance(text, str) and not item_type:
-                text_parts.append(text)
-        elif isinstance(item, str):
-            text_parts.append(item)
-
-    original_text = "\n".join(part for part in text_parts if part).strip()
-    fingerprint = multimodal_content_fingerprint(content)
-    cached = store.get_vision_ocr(fingerprint) if store and fingerprint else None
-    if cached:
-        return format_vision_ocr_content(original_text, cached)
-    return extract_text_content(content)
-
-
-def messages_contain_multimodal(messages: list[dict[str, Any]]) -> bool:
-    """检查消息列表中是否包含多模态内容（如图片）。"""
-    for message in messages:
-        if not isinstance(message, dict):
-            continue
-        content = message.get("content")
-        if isinstance(content, list) and _has_multimodal_parts(content):
-            return True
-    return False
-
-
 def latest_user_message_has_multimodal(messages: list[dict[str, Any]]) -> bool:
-    """仅检查最新一条用户消息是否包含多模态内容（如图片）。
-
-    与 messages_contain_multimodal 不同，此函数只检查最后一轮用户输入，
-    避免因历史消息中残留的图片而重复触发视觉管道。
-    """
+    """仅检查最新一条用户消息是否包含多模态内容（如图片），用于日志提示。"""
     for message in reversed(messages):
         if not isinstance(message, dict):
             continue
@@ -338,56 +253,6 @@ def latest_user_message_has_multimodal(messages: list[dict[str, Any]]) -> bool:
             return True
         return False
     return False
-
-
-def latest_user_multimodal_fingerprint(messages: list[dict[str, Any]]) -> str:
-    """返回最新用户多模态消息的图片指纹；无则空串。"""
-    for message in reversed(messages):
-        if not isinstance(message, dict):
-            continue
-        if message.get("role") != "user":
-            continue
-        content = message.get("content")
-        if isinstance(content, list) and _has_multimodal_parts(content):
-            return multimodal_content_fingerprint(content)
-        return ""
-    return ""
-
-
-def latest_user_turn_is_fresh(messages: list[dict[str, Any]]) -> bool:
-    """最新用户消息之后是否还没有任何 assistant/tool（即本轮刚发出、非工具循环续跑）。"""
-    for index in range(len(messages) - 1, -1, -1):
-        message = messages[index]
-        if not isinstance(message, dict):
-            continue
-        if message.get("role") != "user":
-            continue
-        for later in messages[index + 1 :]:
-            if not isinstance(later, dict):
-                continue
-            if later.get("role") in {"assistant", "tool", "function"}:
-                return False
-        return True
-    return False
-
-
-def should_route_to_vision(
-    messages: list[dict[str, Any]],
-    store: ReasoningStore | None,
-) -> bool:
-    """是否需要调用视觉 API。
-
-    - 最新用户消息无图片 → 否
-    - 已有该图片的 OCR 缓存 → 否（复用缓存，避免工具循环重复识别）
-    - 缓存未命中且是新用户轮次 → 是
-    - 缓存未命中但是工具循环续跑 → 仍尝试识别一次（冷启动兜底）
-    """
-    if not latest_user_message_has_multimodal(messages):
-        return False
-    fingerprint = latest_user_multimodal_fingerprint(messages)
-    if fingerprint and store is not None and store.get_vision_ocr(fingerprint):
-        return False
-    return True
 
 
 def strip_cursor_thinking_blocks(content: str) -> str:
@@ -475,7 +340,6 @@ def normalize_message(
     cache_namespace: str,
     repair_reasoning: bool,
     keep_reasoning: bool,
-    preserve_multimodal: bool = False,
 ) -> tuple[dict[str, Any], bool, bool, dict[str, Any] | None]:
     if not isinstance(message, dict):
         message = {"role": "user", "content": str(message)}
@@ -488,16 +352,10 @@ def normalize_message(
 
     if "content" in normalized:
         content_val = normalized["content"]
-        if preserve_multimodal and isinstance(content_val, list) and _has_multimodal_parts(content_val):
-            # 多模态路由模式：保留数组格式（含 image_url），发送给视觉 API
-            normalized["content"] = content_val
-        else:
-            # DeepSeek 官方 API 不支持多模态/视觉输入，
-            # image_url 等内容类型会被上游以 400 拒绝。转换为纯文本：
-            # 优先注入已缓存的图片识别结果，否则用占位符。
-            normalized["content"] = (
-                extract_text_with_vision_ocr(content_val, store) or ""
-            )
+        # DeepSeek 官方 API 不支持多模态/视觉输入，
+        # image_url 等内容类型会被上游以 400 拒绝。转换为纯文本：
+        # 文本部分直接提取，非文本部分（图片等）替换为占位符提示。
+        normalized["content"] = extract_text_content(content_val) or ""
     elif normalized["role"] in {"assistant", "tool", "system", "user"}:
         normalized["content"] = ""
     if normalized["role"] == "assistant" and isinstance(normalized.get("content"), str):
@@ -762,7 +620,6 @@ def normalize_messages(
     cache_namespace: str,
     repair_reasoning: bool,
     keep_reasoning: bool,
-    preserve_multimodal: bool = False,
 ) -> tuple[list[dict[str, Any]], int, list[int], list[dict[str, Any]]]:
     if not isinstance(messages, list):
         return [], 0, [], []
@@ -778,7 +635,6 @@ def normalize_messages(
             cache_namespace,
             repair_reasoning,
             keep_reasoning,
-            preserve_multimodal=preserve_multimodal,
         )
         normalized_messages.append(normalized)
         if patched:
@@ -1072,53 +928,19 @@ def prepare_upstream_request(
     original_model = str(payload.get("model") or config.upstream_model)
     upstream_model = upstream_model_for(original_model, config)
 
-    # ── 多模态路由检测 ──
-    # 当启用视觉功能（vision_enabled + vision_api_key）且最新用户消息包含图片、
-    # 且尚无 OCR 缓存时，第一遍发送到视觉 API；否则复用缓存的识别文本，
-    # 避免工具循环/多轮续跑时重复调用视觉并冲掉上下文。
-    multimodal_routing = False
-    second_pass_model = ""
-    vision_payload: dict[str, Any] = {}
-    vision_ocr_cache_key = ""
+    # ── 多模态内容检测 ──
+    # DeepSeek 上游是纯文本模型：图片等内容会被转换为文本占位符，
+    # 不会转发给其他模型做识别。
     raw_messages = payload.get("messages")
-    has_multimodal = (
-        isinstance(raw_messages, list)
-        and latest_user_message_has_multimodal(raw_messages)
-    )
-    needs_vision = (
-        isinstance(raw_messages, list)
-        and should_route_to_vision(raw_messages, store)
-    )
-    vision_available = (
-        config.vision_enabled
-        and bool(config.vision_api_key.strip())
-    )
-
-    if needs_vision and vision_available:
-        vision_ocr_cache_key = latest_user_multimodal_fingerprint(raw_messages)
+    if isinstance(raw_messages, list) and latest_user_message_has_multimodal(
+        raw_messages
+    ):
         LOG.info(
-            "检测到多模态内容，启用视觉管道: vision_model=%s deepseek_model=%s "
-            "fresh_turn=%s cache_key=%s",
-            config.vision_model,
-            upstream_model,
-            latest_user_turn_is_fresh(raw_messages),
-            vision_ocr_cache_key[:12] if vision_ocr_cache_key else "",
-        )
-        multimodal_routing = True
-        second_pass_model = upstream_model
-        # 构建第一遍视觉请求体
-        vision_payload = _build_vision_payload(payload, config)
-    elif has_multimodal and vision_available:
-        LOG.info(
-            "检测到多模态内容，复用已缓存的图片识别结果（跳过视觉 API）"
-        )
-    elif has_multimodal:
-        LOG.info(
-            "检测到多模态内容（图片等），视觉功能未启用，"
-            "已转换为文本占位符（设置 vision_enabled=true 并配置 vision_api_key 可启用图片识别）"
+            "检测到多模态内容（图片等），已转换为文本占位符"
+            "（DeepSeek 上游不支持图片输入）"
         )
 
-    # ── 构建 DeepSeek 请求体（第二遍或唯一请求）──
+    # ── 构建 DeepSeek 请求体 ──
     prepared = {
         key: value for key, value in payload.items() if key in SUPPORTED_REQUEST_FIELDS
     }
@@ -1179,7 +1001,7 @@ def prepare_upstream_request(
         authorization,
     )
 
-    # 传入 store 以便在首轮规范化时注入已缓存的图片识别结果；
+    # 传入 store 以便在规范化时复用 reasoning 缓存；
     # repair_reasoning=False，不会在此阶段改写 reasoning。
     pre_repair_messages, _, _, _ = normalize_messages(
         payload.get("messages"),
@@ -1273,10 +1095,6 @@ def prepare_upstream_request(
         recovery_steps=recovery_steps,
         continued_recovery_boundary=continued_recovery_boundary,
         retired_prefix_messages=retired_prefix_messages,
-        multimodal_routing=multimodal_routing,
-        second_pass_model=second_pass_model,
-        vision_payload=vision_payload,
-        vision_ocr_cache_key=vision_ocr_cache_key,
     )
 
 
@@ -1369,234 +1187,3 @@ def prefix_response_content(response_payload: dict[str, Any], prefix: str) -> bo
         message["content"] = prefix + (content if isinstance(content, str) else "")
         return True
     return False
-
-
-# ---------------------------------------------------------------------------
-# 多模态两步管道：视觉 API（如智谱 GLM）→ DeepSeek（推理）
-# 第一遍：视觉 API 识别图片 → 文本
-# 第二遍：DeepSeek 基于文本进行推理
-# ---------------------------------------------------------------------------
-
-# 视觉 API 不需要的 DeepSeek 专用字段
-_VISION_STRIP_FIELDS = {"thinking", "reasoning_effort", "stream_options"}
-
-
-def _build_vision_payload(
-    payload: dict[str, Any],
-    config: "ProxyConfig",
-) -> dict[str, Any]:
-    """构建发送给视觉 API（如智谱 GLM）的第一遍请求体。
-
-    保留原始多模态消息（含 image_url 数组），
-    剥离 DeepSeek 专用字段（thinking 等），强制非流式。
-    """
-    vision = {
-        key: value
-        for key, value in payload.items()
-        if key in SUPPORTED_REQUEST_FIELDS and key not in _VISION_STRIP_FIELDS
-    }
-    vision["model"] = config.vision_model
-    vision["stream"] = False  # 第一遍必须非流式以获取完整文本
-
-    # 规范化消息，保留多模态内容（图片数组)
-    raw_messages = payload.get("messages")
-    if isinstance(raw_messages, list):
-        normalized, _, _, _ = normalize_messages(
-            raw_messages,
-            None,
-            "",
-            repair_reasoning=False,
-            keep_reasoning=False,
-            preserve_multimodal=True,
-        )
-        # 注入语言指令
-        normalized = inject_response_language_instruction(
-            normalized,
-            config.response_language,
-        )
-        normalized, dropped = sanitize_tool_messages(normalized)
-        if dropped:
-            LOG.warning(
-                "视觉请求已丢弃 %s 条无有效 tool_calls 前置的 tool 消息",
-                dropped,
-            )
-        vision["messages"] = strip_recovery_notice_for_upstream(normalized)
-
-    # 清理可能残留的 DeepSeek 字段
-    vision.pop("thinking", None)
-    vision.pop("reasoning_effort", None)
-    vision.pop("stream_options", None)
-
-    return vision
-
-
-def extract_assistant_text_from_response(
-    response_payload: dict[str, Any],
-) -> str:
-    """从 DeepSeek chat completion 响应中提取助手文本内容。"""
-    choices = response_payload.get("choices")
-    if not isinstance(choices, list) or not choices:
-        return ""
-    choice = choices[0]
-    if not isinstance(choice, dict):
-        return ""
-    message = choice.get("message")
-    if not isinstance(message, dict):
-        return ""
-    content = message.get("content")
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts = []
-        for item in content:
-            if isinstance(item, dict):
-                t = item.get("type")
-                text = item.get("text") or item.get("content")
-                if t in ("text", "input_text") and isinstance(text, str):
-                    parts.append(text)
-                elif isinstance(text, str):
-                    parts.append(text)
-            elif isinstance(item, str):
-                parts.append(item)
-        return "\n".join(parts)
-    return str(content) if content else ""
-
-
-def build_second_pass_payload(
-    first_pass_payload: dict[str, Any],
-    first_pass_response_text: str,
-    second_pass_model: str,
-    deepseek_payload: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    """构建第二遍请求：将多模态内容替换为视觉模型识别文本，发给 DeepSeek。
-
-    优先以 deepseek_payload（已修复 reasoning 的请求体）为骨架，仅把其中
-    对应多模态用户消息的 content 替换为识别文本，避免冲掉工具循环上下文。
-    """
-    vision_messages = first_pass_payload.get("messages")
-    if not isinstance(vision_messages, list):
-        vision_messages = []
-
-    base_payload = (
-        dict(deepseek_payload)
-        if isinstance(deepseek_payload, dict)
-        else dict(first_pass_payload)
-    )
-    second_pass = {
-        key: value
-        for key, value in base_payload.items()
-        if key in SUPPORTED_REQUEST_FIELDS or key in {"thinking", "reasoning_effort"}
-    }
-    second_pass["model"] = second_pass_model
-
-    # 若有 deepseek 消息列表：只替换仍带图片占位符的消息，保留历史已注入的 OCR
-    source_messages = second_pass.get("messages")
-    if isinstance(deepseek_payload, dict) and isinstance(source_messages, list):
-        placeholder_marker = "已由 DeepSeek 文本代理省略"
-        ocr_marker = "图片内容已被视觉模型识别"
-        legacy_ocr_marker = "图片内容已被 deepseek-chat 多模态模型识别"
-        replaced_messages: list[dict[str, Any]] = []
-        multimodal_contents = [
-            message.get("content")
-            for message in vision_messages
-            if isinstance(message, dict)
-            and isinstance(message.get("content"), list)
-            and _has_multimodal_parts(message.get("content"))
-        ]
-        # 从后往前对齐：本次视觉结果优先落到最新仍待替换的多模态消息
-        pending_mm = list(reversed(multimodal_contents))
-        pending_replace_indexes: list[int] = []
-        for index, message in enumerate(source_messages):
-            if not isinstance(message, dict):
-                continue
-            content = message.get("content")
-            if not isinstance(content, str):
-                continue
-            if placeholder_marker not in content:
-                continue
-            if ocr_marker in content or legacy_ocr_marker in content:
-                continue
-            pending_replace_indexes.append(index)
-
-        replace_map: dict[int, Any] = {}
-        for index in reversed(pending_replace_indexes):
-            if not pending_mm:
-                break
-            replace_map[index] = pending_mm.pop(0)
-
-        for index, message in enumerate(source_messages):
-            if index not in replace_map or not isinstance(message, dict):
-                replaced_messages.append(message)
-                continue
-            mm_content = replace_map[index]
-            text_parts: list[str] = []
-            if isinstance(mm_content, list):
-                for item in mm_content:
-                    if isinstance(item, dict):
-                        item_type = item.get("type")
-                        text = item.get("text") or item.get("content")
-                        if item_type in ("text", "input_text") and isinstance(text, str):
-                            text_parts.append(text)
-                        elif isinstance(text, str) and not item_type:
-                            text_parts.append(text)
-            original_text = "\n".join(text_parts).strip()
-            new_message = dict(message)
-            new_message["content"] = format_vision_ocr_content(
-                original_text, first_pass_response_text
-            )
-            replaced_messages.append(new_message)
-        second_pass["messages"] = replaced_messages
-        return second_pass
-
-    replaced_messages = []
-    for message in vision_messages:
-        if not isinstance(message, dict):
-            replaced_messages.append(message)
-            continue
-        content = message.get("content")
-        if not isinstance(content, list) or not _has_multimodal_parts(content):
-            replaced_messages.append(message)
-            continue
-
-        text_parts = []
-        for item in content:
-            if isinstance(item, dict):
-                item_type = item.get("type")
-                text = item.get("text") or item.get("content")
-                if item_type in ("text", "input_text") and isinstance(text, str):
-                    text_parts.append(text)
-                elif isinstance(text, str) and not item_type:
-                    text_parts.append(text)
-
-        original_text = "\n".join(text_parts).strip()
-        new_message = dict(message)
-        new_message["content"] = format_vision_ocr_content(
-            original_text, first_pass_response_text
-        )
-        replaced_messages.append(new_message)
-
-    second_pass["messages"] = replaced_messages
-    # 兼容旧路径：从 vision payload 起步时补回 DeepSeek 字段由调用方负责
-    return second_pass
-
-
-def cache_vision_ocr_from_messages(
-    store: ReasoningStore | None,
-    messages: list[dict[str, Any]] | None,
-    ocr_text: str,
-    preferred_key: str = "",
-) -> int:
-    """把视觉识别结果写入缓存，供后续多轮/工具循环复用。
-
-    仅缓存最新用户图片指纹（preferred_key），避免把本次识别结果
-    错误写到历史图片的缓存键上。
-    """
-    if store is None or not ocr_text:
-        return 0
-    key = preferred_key
-    if not key and isinstance(messages, list):
-        key = latest_user_multimodal_fingerprint(messages)
-    if not key:
-        return 0
-    store.put_vision_ocr(key, ocr_text)
-    return 1

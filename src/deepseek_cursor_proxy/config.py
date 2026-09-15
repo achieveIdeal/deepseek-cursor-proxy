@@ -32,10 +32,6 @@ DEFAULT_MISSING_REASONING_STRATEGY = "recover"
 DEFAULT_REASONING_CACHE_MAX_AGE_SECONDS = 30 * 24 * 60 * 60
 DEFAULT_REASONING_CACHE_MAX_ROWS = 100_000
 DEFAULT_RESPONSE_LANGUAGE = "zh"
-DEFAULT_VISION_ENABLED = True
-DEFAULT_VISION_API_KEY = ""  # 从 https://open.bigmodel.cn/usercenter/apikeys 获取免费 API Key
-DEFAULT_VISION_BASE_URL = "https://open.bigmodel.cn/api/paas/v4"
-DEFAULT_VISION_MODEL = "GLM-4.6V"
 
 DEFAULT_CONFIG_HEADER = (
     "# 此文件在 ~/.deepseek-cursor-proxy/config.yaml 自动创建。"
@@ -66,15 +62,6 @@ reasoning_cache_max_rows: {DEFAULT_REASONING_CACHE_MAX_ROWS}
 
 # 注入语言指令，使模型用指定语言思考和回答；设为 off 可关闭。
 response_language: {DEFAULT_RESPONSE_LANGUAGE}
-
-# ── 视觉（多模态）配置 ──
-# 启用后自动将图片发送到智谱 AI（免费）识别为文本，
-# 再将文本回传给 DeepSeek 进行推理。
-# 从 https://open.bigmodel.cn/usercenter/apikeys 获取免费 API Key。
-vision_enabled: {str(DEFAULT_VISION_ENABLED).lower()}
-vision_api_key: "{DEFAULT_VISION_API_KEY}"
-vision_base_url: {DEFAULT_VISION_BASE_URL}
-vision_model: {DEFAULT_VISION_MODEL}
 """
 
 
@@ -242,10 +229,6 @@ class ProxyConfig:
     ngrok_url: str | None = None
     trace_dir: Path | None = None
     response_language: str | None = DEFAULT_RESPONSE_LANGUAGE
-    vision_enabled: bool = DEFAULT_VISION_ENABLED
-    vision_api_key: str = DEFAULT_VISION_API_KEY
-    vision_base_url: str = DEFAULT_VISION_BASE_URL
-    vision_model: str = DEFAULT_VISION_MODEL
 
     @classmethod
     def from_file(
@@ -328,21 +311,5 @@ class ProxyConfig:
             ngrok_url=as_optional_str(setting_value(settings, "ngrok_url")),
             response_language=normalize_response_language(
                 setting_value(settings, "response_language")
-            ),
-            vision_enabled=as_bool(
-                setting_value(settings, "vision_enabled"),
-                DEFAULT_VISION_ENABLED,
-            ),
-            vision_api_key=as_str(
-                setting_value(settings, "vision_api_key"),
-                DEFAULT_VISION_API_KEY,
-            ),
-            vision_base_url=as_str(
-                setting_value(settings, "vision_base_url"),
-                DEFAULT_VISION_BASE_URL,
-            ).rstrip("/"),
-            vision_model=as_str(
-                setting_value(settings, "vision_model"),
-                DEFAULT_VISION_MODEL,
             ),
         )
