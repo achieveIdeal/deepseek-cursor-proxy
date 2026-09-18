@@ -6,6 +6,7 @@ from __future__ import annotations
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
+import os
 import stat
 import threading
 from tempfile import TemporaryDirectory
@@ -42,12 +43,14 @@ class TraceWriterUnitTests(unittest.TestCase):
             self.assertTrue((writer.session_dir / "manifest.json").exists())
             self.assertTrue((writer.session_dir / "request-000001.json").exists())
             self.assertTrue((writer.session_dir / "request-000002.json").exists())
-            self.assertEqual(
-                stat.S_IMODE(
-                    (writer.session_dir / "request-000001.json").stat().st_mode
-                ),
-                0o600,
-            )
+            # Windows 的 chmod 只有只读位语义，st_mode 不是 0o600；权限断言仅 POSIX 有意义。
+            if os.name == "posix":
+                self.assertEqual(
+                    stat.S_IMODE(
+                        (writer.session_dir / "request-000001.json").stat().st_mode
+                    ),
+                    0o600,
+                )
 
     def test_authorization_header_is_redacted(self) -> None:
         with TemporaryDirectory() as temp_dir:
