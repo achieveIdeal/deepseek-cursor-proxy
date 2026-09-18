@@ -32,11 +32,13 @@ from .logging import (
 )
 from .reasoning_store import ReasoningStore, conversation_scope
 from .streaming import CursorReasoningDisplayAdapter, StreamAccumulator
-from .trace import TraceRequest, TraceWriter
+from .trace import TraceRequest, TraceWriter, redact_inline_data_uris
 from .tunnel import NgrokTunnel, local_tunnel_target
 from .transform import (
     RECOVERY_NOTICE_CONTENT,
     PreparedRequest,
+    count_image_parts,
+    model_supports_vision,
     prepare_upstream_request,
     rewrite_response_body,
 )
@@ -675,6 +677,8 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                     self.config.upstream_model,
                     "deepseek-v4-pro",
                     "deepseek-v4-flash",
+                    "deepseek-v4-flash-vision-exp",
+                    "deepseek-flash",
                 ]
             )
         )
@@ -1396,6 +1400,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         choices=["zh", "en", "off"],
         help="注入语言指令：zh（中文）、en（英文）或 off（关闭），默认来自配置或 zh",
     )
+    parser.add_argument(
+        "--vision",
+        choices=["auto", "on", "off"],
+        help=(
+            "图片（多模态）支持：auto 按模型自动判断，"
+            "on 始终转发给上游，off 始终转为文本占位符，默认来自配置或 auto"
+        ),
+    )
     return parser
 
 
@@ -1407,7 +1419,12 @@ def log_json(label: str, payload: Any) -> None:
     LOG.info(
         "%s:\n%s",
         label,
-        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True),
+        json.dumps(
+            redact_inline_data_uris(payload),
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        ),
     )
 
 
@@ -1464,12 +1481,20 @@ def log_context_summary(prepared: Any) -> None:
 
 def log_send_summary(prepared: Any) -> None:
     LOG.info(
-        "├ 发送    user_msgs=%s messages=%s tools=%s reasoning_content=%s",
+        "├ 发送    user_msgs=%s images=%s messages=%s tools=%s reasoning_content=%s",
         format_count(user_message_count(prepared.payload)),
+        format_count(image_part_count(prepared.payload)),
         format_count(message_count(prepared.payload)),
         format_count(tool_count(prepared.payload)),
         format_count(reasoning_content_count(prepared.payload)),
     )
+
+
+def image_part_count(payload: dict[str, Any]) -> int:
+    messages = payload.get("messages")
+    if not isinstance(messages, list):
+        return 0
+    return count_image_parts(messages)
 
 
 def log_stats_summary(usage: dict[str, Any] | None) -> None:
@@ -1734,6 +1759,8 @@ def main(argv: list[str] | None = None) -> int:
         updates["response_language"] = (
             None if args.response_language == "off" else args.response_language
         )
+    if args.vision is not None:
+        updates["vision"] = args.vision
     if updates:
         config = replace(config, **updates)
 
@@ -1785,6 +1812,17 @@ def main(argv: list[str] | None = None) -> int:
         "思考模式" if config.thinking == "enabled" else "无思考模式",
         config.reasoning_effort,
     )
+    if config.vision == "auto":
+        LOG.info(
+            "图片支持: auto（默认模型 %s）",
+            (
+                "支持图片，将原样转发"
+                if model_supports_vision(config.upstream_model)
+                else "不支持图片，图片将转为文本占位符（可用 --vision on 强制转发）"
+            ),
+        )
+    else:
+        LOG.info("图片支持: %s", config.vision)
 
     if config.verbose:
         display_reasoning = "关闭"

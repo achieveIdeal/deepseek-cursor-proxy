@@ -13,6 +13,9 @@ from typing import Any
 
 TRACE_SCHEMA_VERSION = 1
 
+# 追踪/日志中单个字符串（通常是 data:image/...;base64）超过该长度即截断。
+MAX_INLINE_DATA_URI_CHARS = 512
+
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
@@ -20,6 +23,32 @@ def utc_now_iso() -> str:
 
 def sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def redact_inline_data_uris(
+    value: Any,
+    max_chars: int = MAX_INLINE_DATA_URI_CHARS,
+) -> Any:
+    """截断展示/落盘副本中的超长 data: URL（图片 base64）。
+
+    仅用于日志与追踪的副本，绝不修改转发给上游的请求体；截断处保留
+    原串长度与 sha256 前缀，仍可用于比对两次请求是否携带同一张图片。
+    """
+    if isinstance(value, str):
+        if len(value) > max_chars and value.startswith("data:"):
+            omitted = len(value) - max_chars
+            return (
+                f"{value[:max_chars]}"
+                f"...<已省略 {omitted} 字符 sha256={sha256_text(value)[:12]}>"
+            )
+        return value
+    if isinstance(value, dict):
+        return {
+            key: redact_inline_data_uris(item, max_chars) for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [redact_inline_data_uris(item, max_chars) for item in value]
+    return value
 
 
 def authorization_summary(authorization: str | None) -> dict[str, Any]:
@@ -221,8 +250,9 @@ class TraceRequest:
     _finished: bool = False
 
     def record_cursor_body(self, payload: dict[str, Any]) -> None:
-        self.data["request"]["body"] = payload
-        self.data["request"]["summary"] = payload_summary(payload)
+        redacted = redact_inline_data_uris(payload)
+        self.data["request"]["body"] = redacted
+        self.data["request"]["summary"] = payload_summary(redacted)
 
     def record_cursor_body_bytes(self, body: bytes) -> None:
         self.data["request"]["body_bytes"] = len(body)
@@ -232,9 +262,10 @@ class TraceRequest:
         except json.JSONDecodeError:
             self.data["request"]["body"] = {"text": text}
             return
-        self.data["request"]["body"] = payload
-        if isinstance(payload, dict):
-            self.data["request"]["summary"] = payload_summary(payload)
+        redacted = redact_inline_data_uris(payload)
+        self.data["request"]["body"] = redacted
+        if isinstance(redacted, dict):
+            self.data["request"]["summary"] = payload_summary(redacted)
 
     def record_cursor_body_omitted(
         self, *, reason: str, body_bytes: int | None = None
@@ -245,9 +276,11 @@ class TraceRequest:
         self.data["request"]["body_omitted"] = omitted
 
     def record_transform(self, prepared: Any) -> None:
+        redacted_body = redact_inline_data_uris(prepared.payload)
         self.data["transform"] = {
             "original_model": prepared.original_model,
             "upstream_model": prepared.upstream_model,
+            "vision_enabled": bool(getattr(prepared, "vision_enabled", False)),
             "cache_namespace": prepared.cache_namespace,
             "patched_reasoning_messages": prepared.patched_reasoning_messages,
             "missing_reasoning_messages": prepared.missing_reasoning_messages,
@@ -262,8 +295,8 @@ class TraceRequest:
             "retired_prefix_messages": prepared.retired_prefix_messages,
             "reasoning_diagnostics": prepared.reasoning_diagnostics,
             "recovery_steps": prepared.recovery_steps,
-            "upstream_request_summary": payload_summary(prepared.payload),
-            "upstream_request_body": prepared.payload,
+            "upstream_request_summary": payload_summary(redacted_body),
+            "upstream_request_body": redacted_body,
         }
 
     def record_upstream_request(

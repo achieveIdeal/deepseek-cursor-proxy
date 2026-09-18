@@ -26,13 +26,15 @@ DEFAULT_COLLAPSIBLE_REASONING = True
 DEFAULT_NGROK = True
 DEFAULT_VERBOSE = False
 DEFAULT_REQUEST_TIMEOUT = 300.0
-DEFAULT_MAX_REQUEST_BODY_BYTES = 20 * 1024 * 1024
+DEFAULT_MAX_REQUEST_BODY_BYTES = 48 * 1024 * 1024
 DEFAULT_STREAM_IDLE_PING_SECONDS = 15.0
 DEFAULT_CORS = False
 DEFAULT_MISSING_REASONING_STRATEGY = "recover"
 DEFAULT_REASONING_CACHE_MAX_AGE_SECONDS = 30 * 24 * 60 * 60
 DEFAULT_REASONING_CACHE_MAX_ROWS = 100_000
 DEFAULT_RESPONSE_LANGUAGE = "zh"
+# 图片（多模态）支持策略：auto 按模型自动判断，on 始终转发，off 始终转占位符。
+DEFAULT_VISION = "auto"
 
 DEFAULT_CONFIG_HEADER = (
     "# 此文件在 ~/.deepseek-cursor-proxy/config.yaml 自动创建。"
@@ -66,6 +68,11 @@ reasoning_cache_max_rows: {DEFAULT_REASONING_CACHE_MAX_ROWS}
 
 # 注入语言指令，使模型用指定语言思考和回答；设为 off 可关闭。
 response_language: {DEFAULT_RESPONSE_LANGUAGE}
+
+# 图片（多模态）支持：auto 时仅当模型为 DeepSeek 视觉模型
+# （如 deepseek-v4-flash-vision-exp / deepseek-flash）才转发图片，
+# 其余模型把图片转为文本占位符；on 始终转发；off 始终转占位符。
+vision: {DEFAULT_VISION}
 """
 
 
@@ -211,6 +218,21 @@ def normalize_response_language(value: Any) -> str | None:
     return DEFAULT_RESPONSE_LANGUAGE
 
 
+def normalize_vision(value: Any) -> str:
+    if value is MISSING or value is None:
+        return DEFAULT_VISION
+    if isinstance(value, bool):
+        return "on" if value else "off"
+    normalized = str(value).strip().lower()
+    if normalized in {"auto", "on", "off"}:
+        return normalized
+    if normalized in TRUE_VALUES:
+        return "on"
+    if normalized in FALSE_VALUES:
+        return "off"
+    return DEFAULT_VISION
+
+
 @dataclass(frozen=True)
 class ProxyConfig:
     host: str = DEFAULT_HOST
@@ -234,6 +256,7 @@ class ProxyConfig:
     ngrok_url: str | None = None
     trace_dir: Path | None = None
     response_language: str | None = DEFAULT_RESPONSE_LANGUAGE
+    vision: str = DEFAULT_VISION
 
     @classmethod
     def from_file(
@@ -321,4 +344,5 @@ class ProxyConfig:
             response_language=normalize_response_language(
                 setting_value(settings, "response_language")
             ),
+            vision=normalize_vision(setting_value(settings, "vision")),
         )

@@ -18,6 +18,7 @@ from deepseek_cursor_proxy.config import (
     DEFAULT_THINKING,
     DEFAULT_UPSTREAM_MODEL,
     DEFAULT_VERBOSE,
+    DEFAULT_VISION,
     ProxyConfig,
     default_config_path,
     default_reasoning_content_path,
@@ -74,6 +75,7 @@ class ConfigTests(unittest.TestCase):
                 config_text,
             )
             self.assertIn(f"ngrok: {str(DEFAULT_NGROK).lower()}", config_text)
+            self.assertIn(f"vision: {DEFAULT_VISION}", config_text)
             self.assertIn(
                 "collasible_reasoning: "
                 f"{str(DEFAULT_COLLAPSIBLE_REASONING).lower()}",
@@ -108,6 +110,7 @@ class ConfigTests(unittest.TestCase):
             self.assertFalse(config_path.exists())
             self.assertEqual(config.upstream_model, DEFAULT_UPSTREAM_MODEL)
             self.assertEqual(config.ngrok, DEFAULT_NGROK)
+            self.assertEqual(config.vision, DEFAULT_VISION)
             self.assertEqual(
                 config.reasoning_cache_max_age_seconds,
                 DEFAULT_REASONING_CACHE_MAX_AGE_SECONDS,
@@ -142,6 +145,7 @@ class ConfigTests(unittest.TestCase):
                         "reasoning_cache_max_age_seconds: 60",
                         "reasoning_cache_max_rows: 50",
                         "ngrok_url: https://example.ngrok.dev",
+                        "vision: on",
                     ]
                 ),
                 encoding="utf-8",
@@ -168,6 +172,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.reasoning_cache_max_age_seconds, 60)
         self.assertEqual(config.reasoning_cache_max_rows, 50)
         self.assertEqual(config.ngrok_url, "https://example.ngrok.dev")
+        self.assertEqual(config.vision, "on")
 
     def test_invalid_config_values_fall_back_to_defaults(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -181,6 +186,7 @@ class ConfigTests(unittest.TestCase):
                         "verbose: maybe",
                         "collasible_reasoning: maybe",
                         "stream_idle_ping_seconds: nope",
+                        "vision: maybe",
                     ]
                 ),
                 encoding="utf-8",
@@ -202,6 +208,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(
             config.stream_idle_ping_seconds, DEFAULT_STREAM_IDLE_PING_SECONDS
         )
+        self.assertEqual(config.vision, DEFAULT_VISION)
 
     def test_ngrok_url_empty_or_whitespace_is_none(self) -> None:
         with TemporaryDirectory() as temp_dir:

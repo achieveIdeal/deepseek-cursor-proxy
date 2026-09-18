@@ -519,6 +519,80 @@ class StrictRejectModeTests(_StrictUpstreamCase):
         self.assertEqual(StrictFakeDeepSeek.requests, [])
 
 
+class VisionForwardingTests(_StrictUpstreamCase):
+    """视觉模型保留图片块直达上游；纯文本模型退化为文本占位符。"""
+
+    @staticmethod
+    def _user_message(payload: dict[str, Any]) -> dict[str, Any]:
+        return next(
+            message
+            for message in payload["messages"]
+            if message.get("role") == "user"
+        )
+
+    def test_vision_model_forwards_image_parts_to_upstream(self) -> None:
+        status, _body = _post(
+            f"{self.proxy.url}/v1/chat/completions",
+            {
+                "model": "deepseek-v4-flash-vision-exp",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "看看这张图"},
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": "data:image/png;base64,AAAA"},
+                            },
+                        ],
+                    }
+                ],
+                "stream": False,
+            },
+        )
+
+        self.assertEqual(status, 200)
+        upstream_user = self._user_message(StrictFakeDeepSeek.requests[-1])
+        self.assertEqual(
+            upstream_user["content"],
+            [
+                {"type": "text", "text": "看看这张图"},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/png;base64,AAAA"},
+                },
+            ],
+        )
+
+    def test_text_model_strips_image_parts_before_upstream(self) -> None:
+        status, _body = _post(
+            f"{self.proxy.url}/v1/chat/completions",
+            {
+                "model": "deepseek-v4-pro",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "看看这张图"},
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": "data:image/png;base64,AAAA"},
+                            },
+                        ],
+                    }
+                ],
+                "stream": False,
+            },
+        )
+
+        self.assertEqual(status, 200)
+        upstream_user = self._user_message(StrictFakeDeepSeek.requests[-1])
+        self.assertEqual(
+            upstream_user["content"],
+            "看看这张图\n[image_url 已由 DeepSeek 文本代理省略]",
+        )
+
+
 class ThinkingDisabledTests(_StrictUpstreamCase):
     config_overrides = {"thinking": "disabled"}
 

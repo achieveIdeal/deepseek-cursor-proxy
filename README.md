@@ -1,7 +1,7 @@
 <!-- <h1><img src="assets/logo.png" width="120" alt="deepseek-cursor-proxy logo" style="vertical-align: middle;">&nbsp;DeepSeek Cursor Proxy</h1> -->
 <h1 align="center"><img src="assets/logo.png" width="150" alt="deepseek-cursor-proxy logo"><br>DeepSeek Cursor 代理</h1>
 
-一个兼容性代理，通过正确处理 DeepSeek 工具调用推理 API 请求中的 `reasoning_content` 字段，将 Cursor 连接到 DeepSeek 思考模型（`deepseek-v4-pro` 和 `deepseek-v4-flash`）。
+一个兼容性代理，通过正确处理 DeepSeek 工具调用推理 API 请求中的 `reasoning_content` 字段，将 Cursor 连接到 DeepSeek 思考模型（`deepseek-v4-pro` 和 `deepseek-v4-flash`）。还支持把 Cursor 中发送的图片转发给 DeepSeek 视觉模型（`deepseek-v4-flash-vision-exp` / `deepseek-flash`）。
 
 此代理还可以帮助 **Cursor 以外的其他应用和编程代理**，当它们遇到 DeepSeek 思考模式 API 中缺少 `reasoning_content` 的相同问题时。只需将它们的 API 基础 URL 指向此代理即可。
 
@@ -115,6 +115,9 @@ deepseek-cursor-proxy --ngrok-url https://your-subdomain.ngrok.dev
 
 # 使用不同的本地端口
 deepseek-cursor-proxy --port 9000
+
+# 强制把图片转发给上游（自定义视觉端点/新模型别名时使用）
+deepseek-cursor-proxy --vision on
 ```
 
 ### 步骤 3：在 Cursor 中添加自定义模型
@@ -126,6 +129,8 @@ deepseek-cursor-proxy --port 9000
 - Base URL：带 `/v1` API 版本路径的 ngrok HTTPS URL
 
 代理会尊重 Cursor 发送的 DeepSeek 模型名称，如 `deepseek-v4-pro` 或 `deepseek-v4-flash`。`config.yaml` 中的 `model` 字段仅在请求未包含模型时作为回退使用。
+
+**发送图片：** 在 Cursor 中选择支持视觉的模型名（如 `deepseek-v4-flash-vision-exp` 或 `deepseek-flash`），代理会把消息中的图片块原样转发给上游，包括 Cursor 粘贴图片的 base64 data URL 与外部 HTTP(S) 链接。非视觉模型收到图片时会自动降级为文本占位符（`vision: auto` 默认行为）；可用 `--vision on` 强制转发、`--vision off` 始终禁用。注意两点：DeepSeek 只接受 `user` 消息中的图片；base64 图片会计入请求体大小（代理默认上限 48 MiB，与上游一致）。
 
 例如，若 ngrok 控制台显示 `https://example.ngrok-free.dev`，请使用：
 
@@ -151,7 +156,7 @@ https://example.ngrok-free.dev/v1
 - **核心修复：** DeepSeek [思考模式工具调用](https://api-docs.deepseek.com/guides/thinking_mode#tool-calls) 要求在后续请求中传回完整的**多轮** `reasoning_content` 链。Cursor 省略该字段会导致 400 错误。代理（`Cursor -> ngrok -> 代理 -> DeepSeek API`）存储 DeepSeek 原始的 `reasoning_content`，并将缺失的块补回发出的工具调用历史。
 - **多对话隔离：** 为避免并发对话之间的冲突，代理通过规范对话前缀（角色、内容和工具调用，不含 `reasoning_content`）的 SHA-256 哈希，加上上游模型、配置和 API 密钥哈希来限定缓存键作用域。不同线程获得不同作用域，复用的工具调用 ID 不会冲突。字节级相同的克隆历史产生相同作用域。
 - **上下文缓存兼容性：** 代理通过从不注入合成线程 ID、时间戳或 cache-control 消息来保持兼容性。它以原始字符串精确恢复 `reasoning_content`，使重复前缀保持完整以支持 [DeepSeek 上下文缓存](https://api-docs.deepseek.com/guides/kv_cache)。缓存命中率会记录在终端输出中。
-- **其他兼容性修复：** 除 reasoning 修复外，代理还将旧版 `functions`/`function_call` 字段转换为 `tools`/`tool_choice`，保留 required 和 named 工具选择语义，规范化 `reasoning_effort` 别名，从助手内容中剥离镜像的思考显示块，将多部分内容数组展平为纯文本，并将 `reasoning_content` 镜像到 Cursor 可见的 Markdown details 块中。
+- **其他兼容性修复：** 除 reasoning 修复外，代理还将旧版 `functions`/`function_call` 字段转换为 `tools`/`tool_choice`，保留 required 和 named 工具选择语义，规范化 `reasoning_effort` 别名，从助手内容中剥离镜像的思考显示块，在非视觉模型下将多部分内容数组展平为纯文本、在视觉模型下保留并将各客户端（OpenAI / Responses / Anthropic 风格）的图片块统一规范化为 `image_url` 格式，并将 `reasoning_content` 镜像到 Cursor 可见的 Markdown details 块中。
 
 ## 开发
 

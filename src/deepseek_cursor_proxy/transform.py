@@ -78,6 +78,23 @@ EFFORT_ALIASES = {
     "xhigh": "max",
 }
 
+# DeepSeek 多模态（视觉）模型：仅这些模型接受 user 消息中的图片块。
+# deepseek-v4-flash-vision-exp 已由 deepseek-flash 承接，但保留别名以兼容旧配置。
+VISION_MODEL_IDS = {
+    "deepseek-flash",
+    "deepseek-v4-flash-vision-exp",
+    "deepseek-v4-vision",
+}
+
+# 各客户端使用的图片块类型；统一规范化为 Chat Completions 的 image_url 块。
+IMAGE_PART_TYPES = {"image_url", "input_image", "image"}
+
+# 图片块无法转发时使用的文本占位符。
+OMITTED_PART_TEMPLATE = "[{} 已由 DeepSeek 文本代理省略]"
+
+# DeepSeek 接受的 detail 级别。
+VALID_IMAGE_DETAIL_LEVELS = {"low", "high", "original", "auto"}
+
 CURSOR_THINKING_BLOCK_RE = re.compile(
     r"""
     (?:
@@ -192,6 +209,8 @@ class PreparedRequest:
     recovery_steps: list[dict[str, Any]] = field(default_factory=list)
     continued_recovery_boundary: bool = False
     retired_prefix_messages: int = 0
+    # 本次请求是否按视觉模型转发图片（trace/日志用）。
+    vision_enabled: bool = False
 
 
 def normalize_reasoning_effort(value: Any) -> str:
@@ -201,37 +220,170 @@ def normalize_reasoning_effort(value: Any) -> str:
 
 
 def extract_text_content(content: Any) -> str | None:
+    """把 content（含多部分数组）压平为纯文本，图片等非文本块转为占位符。"""
+    normalized = normalize_content(content, vision_enabled=False, role="user")
+    if normalized is None or isinstance(normalized, str):
+        return normalized
+    return json.dumps(normalized, ensure_ascii=False, sort_keys=True)
+
+
+def model_supports_vision(model: str) -> bool:
+    """判断上游模型是否支持图片输入（DeepSeek 多模态模型）。"""
+    normalized = (model or "").strip().lower()
+    if not normalized:
+        return False
+    if normalized in VISION_MODEL_IDS:
+        return True
+    # 宽松匹配新别名与自建端点：名称含 vision / multimodal 即视为支持。
+    return "vision" in normalized or "multimodal" in normalized
+
+
+def vision_enabled_for(config: ProxyConfig, upstream_model: str) -> bool:
+    """结合配置与模型名决定是否向上游转发图片。"""
+    setting = str(getattr(config, "vision", "auto") or "auto").strip().lower()
+    if setting == "on":
+        return True
+    if setting == "off":
+        return False
+    return model_supports_vision(upstream_model)
+
+
+def normalize_image_part(part: dict[str, Any]) -> dict[str, Any] | None:
+    """把客户端图片块规范化为 DeepSeek Chat Completions 接受的 image_url 块。
+
+    覆盖三种常见形态：
+    - Chat Completions: {"type": "image_url", "image_url": {"url": ...}}
+    - Responses API:    {"type": "input_image", "image_url": "..."}
+    - Anthropic:        {"type": "image", "source": {"type": "base64"|"url", ...}}
+    无法识别的形态返回 None，由调用方降级为文本占位符。
+    """
+    part_type = str(part.get("type") or "")
+    detail = part.get("detail")
+    url: Any = None
+
+    if part_type in {"image_url", "input_image"}:
+        image_url = part.get("image_url")
+        if isinstance(image_url, dict):
+            url = image_url.get("url")
+            if "detail" in image_url:
+                detail = image_url.get("detail")
+        elif isinstance(image_url, str):
+            url = image_url
+    elif part_type == "image":
+        source = part.get("source")
+        if not isinstance(source, dict):
+            return None
+        source_type = str(source.get("type") or "")
+        if source_type == "base64":
+            data = source.get("data")
+            if not isinstance(data, str) or not data:
+                return None
+            media_type = str(source.get("media_type") or "image/png")
+            url = f"data:{media_type};base64,{data}"
+        elif source_type == "url":
+            url = source.get("url")
+        else:
+            return None
+
+    if not isinstance(url, str) or not url.strip():
+        return None
+
+    image_url_payload: dict[str, Any] = {"url": url}
+    if isinstance(detail, str) and detail in VALID_IMAGE_DETAIL_LEVELS:
+        image_url_payload["detail"] = detail
+    return {"type": "image_url", "image_url": image_url_payload}
+
+
+def normalize_content(
+    content: Any,
+    *,
+    vision_enabled: bool = False,
+    role: str = "user",
+) -> Any:
+    """规范化消息 content，返回字符串（纯文本）或块数组（含图片）。
+
+    - 非列表 content 原样返回（None/str），dict/tuple 退化为 JSON 文本。
+    - 列表内容：仅当 vision_enabled 且 role 为 "user" 时保留图片块
+      （DeepSeek 会以 400 拒绝 system/assistant 消息中的图片），
+      其余情况图片块降级为文本占位符。
+    - 数组中若没有任何可保留的图片块，则压平为字符串，与历史请求及
+      reasoning 缓存签名保持兼容。
+    """
     if content is None or isinstance(content, str):
         return content
-    if isinstance(content, list):
-        parts: list[str] = []
-        for item in content:
-            if isinstance(item, str):
-                parts.append(item)
-                continue
-            if not isinstance(item, dict):
-                parts.append(str(item))
-                continue
-            item_type = item.get("type")
-            text = item.get("text") or item.get("content")
-            if item_type in {"text", "input_text"} and isinstance(text, str):
-                parts.append(text)
-            elif isinstance(text, str):
-                parts.append(text)
-            elif item_type:
-                parts.append(f"[{item_type} 已由 DeepSeek 文本代理省略]")
-        return "\n".join(part for part in parts if part)
     if isinstance(content, (dict, tuple)):
         return json.dumps(content, ensure_ascii=False, sort_keys=True)
-    return str(content)
+    if not isinstance(content, list):
+        return str(content)
+
+    allow_images = bool(vision_enabled) and role == "user"
+    text_parts: list[str] = []
+    blocks: list[dict[str, Any]] = []
+    has_image = False
+
+    def flush_text() -> None:
+        if text_parts:
+            blocks.append(
+                {"type": "text", "text": "\n".join(part for part in text_parts if part)}
+            )
+            text_parts.clear()
+
+    for item in content:
+        if isinstance(item, str):
+            text_parts.append(item)
+            continue
+        if not isinstance(item, dict):
+            text_parts.append(str(item))
+            continue
+        item_type = str(item.get("type") or "")
+        if item_type in IMAGE_PART_TYPES:
+            image_block = normalize_image_part(item) if allow_images else None
+            if image_block is not None:
+                flush_text()
+                blocks.append(image_block)
+                has_image = True
+            else:
+                text_parts.append(OMITTED_PART_TEMPLATE.format(item_type))
+            continue
+        text = item.get("text") or item.get("content")
+        if isinstance(text, str):
+            text_parts.append(text)
+        elif item_type:
+            text_parts.append(OMITTED_PART_TEMPLATE.format(item_type))
+    flush_text()
+
+    if not has_image:
+        return "\n".join(
+            part
+            for block in blocks
+            for part in [block.get("text")]
+            if isinstance(part, str) and part
+        )
+    return blocks
+
+
+def count_image_parts(messages: list[dict[str, Any]]) -> int:
+    """统计 user 消息 content 数组中可转发的图片块数量（用于日志）。"""
+    total = 0
+    for message in messages:
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        total += sum(
+            1
+            for part in content
+            if isinstance(part, dict) and part.get("type") in IMAGE_PART_TYPES
+        )
+    return total
 
 
 def _has_multimodal_parts(content: list[Any]) -> bool:
     """检查内容数组中是否包含非文本部分（图片、音频等多模态内容）。
 
     纯文本部分类型为 "text" 或 "input_text"，可安全合并为字符串；
-    任何其他类型（如 "image_url"）都只能被丢弃为文本占位符，
-    DeepSeek 上游不接受这类内容。
+    任何其他类型（如 "image_url"）在纯文本模型下都只能被丢弃为文本占位符。
     """
     for item in content:
         if isinstance(item, dict):
@@ -340,6 +492,7 @@ def normalize_message(
     cache_namespace: str,
     repair_reasoning: bool,
     keep_reasoning: bool,
+    vision_enabled: bool = False,
 ) -> tuple[dict[str, Any], bool, bool, dict[str, Any] | None]:
     if not isinstance(message, dict):
         message = {"role": "user", "content": str(message)}
@@ -352,10 +505,17 @@ def normalize_message(
 
     if "content" in normalized:
         content_val = normalized["content"]
-        # DeepSeek 官方 API 不支持多模态/视觉输入，
-        # image_url 等内容类型会被上游以 400 拒绝。转换为纯文本：
-        # 文本部分直接提取，非文本部分（图片等）替换为占位符提示。
-        normalized["content"] = extract_text_content(content_val) or ""
+        # DeepSeek 纯文本模型会以 400 拒绝图片块，需转换为文本占位符；
+        # 仅当上游为视觉模型（vision_enabled）且角色为 user 时保留图片，
+        # 并规范化为 Chat Completions 的 image_url 格式。
+        normalized["content"] = (
+            normalize_content(
+                content_val,
+                vision_enabled=vision_enabled,
+                role=str(normalized["role"]),
+            )
+            or ""
+        )
     elif normalized["role"] in {"assistant", "tool", "system", "user"}:
         normalized["content"] = ""
     if normalized["role"] == "assistant" and isinstance(normalized.get("content"), str):
@@ -624,6 +784,7 @@ def normalize_messages(
     cache_namespace: str,
     repair_reasoning: bool,
     keep_reasoning: bool,
+    vision_enabled: bool = False,
 ) -> tuple[list[dict[str, Any]], int, list[int], list[dict[str, Any]]]:
     if not isinstance(messages, list):
         return [], 0, [], []
@@ -639,6 +800,7 @@ def normalize_messages(
             cache_namespace,
             repair_reasoning,
             keep_reasoning,
+            vision_enabled=vision_enabled,
         )
         normalized_messages.append(normalized)
         if patched:
@@ -931,18 +1093,26 @@ def prepare_upstream_request(
 ) -> PreparedRequest:
     original_model = str(payload.get("model") or config.upstream_model)
     upstream_model = upstream_model_for(original_model, config)
+    vision_enabled = vision_enabled_for(config, upstream_model)
 
     # ── 多模态内容检测 ──
-    # DeepSeek 上游是纯文本模型：图片等内容会被转换为文本占位符，
-    # 不会转发给其他模型做识别。
+    # vision_enabled 时图片原样转发给 DeepSeek 视觉模型；否则图片会被
+    # 转换为文本占位符（纯文本模型会以 400 拒绝图片块）。
     raw_messages = payload.get("messages")
     if isinstance(raw_messages, list) and latest_user_message_has_multimodal(
         raw_messages
     ):
-        LOG.info(
-            "检测到多模态内容（图片等），已转换为文本占位符"
-            "（DeepSeek 上游不支持图片输入）"
-        )
+        if vision_enabled:
+            LOG.info(
+                "检测到多模态内容（图片等），将原样转发给视觉模型 %s",
+                upstream_model,
+            )
+        else:
+            LOG.info(
+                "检测到多模态内容（图片等），已转换为文本占位符"
+                "（模型 %s 不支持图片输入；可用 --vision on 强制转发）",
+                upstream_model,
+            )
 
     # ── 构建 DeepSeek 请求体 ──
     prepared = {
@@ -1013,6 +1183,7 @@ def prepare_upstream_request(
         cache_namespace,
         repair_reasoning=False,
         keep_reasoning=not thinking_disabled,
+        vision_enabled=vision_enabled,
     )
     record_response_messages = pre_repair_messages
     record_response_scope = conversation_scope(
@@ -1039,6 +1210,7 @@ def prepare_upstream_request(
             cache_namespace,
             repair_reasoning=thinking_enabled,
             keep_reasoning=not thinking_disabled,
+            vision_enabled=vision_enabled,
         )
     )
     while missing_indexes and config.missing_reasoning_strategy == "recover":
@@ -1063,6 +1235,7 @@ def prepare_upstream_request(
             cache_namespace,
             repair_reasoning=thinking_enabled,
             keep_reasoning=not thinking_disabled,
+            vision_enabled=vision_enabled,
         )
         reasoning_diagnostics.extend(latest_diagnostics)
     active_record_response_scope = conversation_scope(messages, cache_namespace)
@@ -1099,6 +1272,7 @@ def prepare_upstream_request(
         recovery_steps=recovery_steps,
         continued_recovery_boundary=continued_recovery_boundary,
         retired_prefix_messages=retired_prefix_messages,
+        vision_enabled=vision_enabled,
     )
 
 

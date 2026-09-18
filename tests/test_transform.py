@@ -21,8 +21,10 @@ from deepseek_cursor_proxy.transform import (
     RECOVERY_NOTICE_CONTENT,
     RECOVERY_NOTICE_TEXT,
     RESPONSE_LANGUAGE_INSTRUCTIONS,
+    count_image_parts,
     extract_text_content,
     inject_response_language_instruction,
+    model_supports_vision,
     normalize_reasoning_effort,
     prepare_upstream_request,
     reasoning_cache_namespace,
@@ -85,6 +87,283 @@ class ContentHelpersTests(unittest.TestCase):
         self.assertEqual(normalize_reasoning_effort("max"), "max")
         self.assertEqual(normalize_reasoning_effort("xhigh"), "max")
         self.assertEqual(normalize_reasoning_effort("nonsense"), "high")
+
+
+class VisionContentTests(unittest.TestCase):
+    """图片（多模态）转发的单元测试：仅视觉模型保留图片块。"""
+
+    def setUp(self) -> None:
+        self.store = ReasoningStore(":memory:")
+
+    def tearDown(self) -> None:
+        self.store.close()
+
+    @staticmethod
+    def _user_message(prepared) -> dict:
+        return next(
+            message
+            for message in prepared.payload["messages"]
+            if message.get("role") == "user"
+        )
+
+    @staticmethod
+    def _image_message(model: str, vision_url: str = "data:image/png;base64,AAAA") -> dict:
+        return {
+            "model": model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "看看这张图"},
+                        {"type": "image_url", "image_url": {"url": vision_url}},
+                    ],
+                }
+            ],
+        }
+
+    def test_model_supports_vision_detection(self) -> None:
+        self.assertTrue(model_supports_vision("deepseek-v4-flash-vision-exp"))
+        self.assertTrue(model_supports_vision("deepseek-flash"))
+        self.assertTrue(model_supports_vision("my-custom-vision-endpoint"))
+        self.assertFalse(model_supports_vision("deepseek-v4-pro"))
+        self.assertFalse(model_supports_vision("deepseek-v4-flash"))
+        self.assertFalse(model_supports_vision(""))
+
+    def test_vision_model_keeps_image_parts(self) -> None:
+        prepared = prepare_upstream_request(
+            self._image_message("deepseek-v4-flash-vision-exp"),
+            ProxyConfig(),
+            self.store,
+        )
+        self.assertTrue(prepared.vision_enabled)
+        self.assertEqual(
+            self._user_message(prepared)["content"],
+            [
+                {"type": "text", "text": "看看这张图"},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/png;base64,AAAA"},
+                },
+            ],
+        )
+
+    def test_vision_model_keeps_detail_level_and_string_image_url(self) -> None:
+        prepared = prepare_upstream_request(
+            {
+                "model": "deepseek-flash",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "hi"},
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": "https://example.com/a.png",
+                                    "detail": "low",
+                                },
+                            },
+                            {"type": "input_image", "image_url": "https://example.com/b.png"},
+                        ],
+                    }
+                ],
+            },
+            ProxyConfig(),
+            self.store,
+        )
+        content = self._user_message(prepared)["content"]
+        self.assertEqual(
+            content[1],
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": "https://example.com/a.png",
+                    "detail": "low",
+                },
+            },
+        )
+        self.assertEqual(
+            content[2],
+            {
+                "type": "image_url",
+                "image_url": {"url": "https://example.com/b.png"},
+            },
+        )
+
+    def test_invalid_detail_level_is_dropped(self) -> None:
+        prepared = prepare_upstream_request(
+            self._image_message("deepseek-flash", "https://example.com/a.png"),
+            ProxyConfig(),
+            self.store,
+        )
+        content = self._user_message(prepared)["content"]
+        # _image_message 未提供 detail；确认不会凭空注入非法字段。
+        self.assertNotIn("detail", content[1]["image_url"])
+
+        prepared = prepare_upstream_request(
+            {
+                "model": "deepseek-flash",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": "https://example.com/a.png",
+                                    "detail": "huge",
+                                },
+                            }
+                        ],
+                    }
+                ],
+            },
+            ProxyConfig(),
+            self.store,
+        )
+        content = self._user_message(prepared)["content"]
+        self.assertEqual(
+            content[0],
+            {
+                "type": "image_url",
+                "image_url": {"url": "https://example.com/a.png"},
+            },
+        )
+
+    def test_anthropic_style_image_part_is_converted(self) -> None:
+        prepared = prepare_upstream_request(
+            {
+                "model": "deepseek-flash",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "hi"},
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": "image/jpeg",
+                                    "data": "BBBB",
+                                },
+                            },
+                        ],
+                    }
+                ],
+            },
+            ProxyConfig(),
+            self.store,
+        )
+        content = self._user_message(prepared)["content"]
+        self.assertEqual(
+            content[1]["image_url"]["url"],
+            "data:image/jpeg;base64,BBBB",
+        )
+
+    def test_vision_mode_flattens_text_only_arrays(self) -> None:
+        prepared = prepare_upstream_request(
+            {
+                "model": "deepseek-flash",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "hello"},
+                            {"type": "input_text", "text": "world"},
+                        ],
+                    }
+                ],
+            },
+            ProxyConfig(),
+            self.store,
+        )
+        self.assertEqual(self._user_message(prepared)["content"], "hello\nworld")
+
+    def test_system_message_images_fall_back_to_placeholder(self) -> None:
+        prepared = prepare_upstream_request(
+            {
+                "model": "deepseek-flash",
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": [
+                            {"type": "text", "text": "rules"},
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": "data:image/png;base64,AAAA"},
+                            },
+                        ],
+                    },
+                    {"role": "user", "content": "hi"},
+                ],
+            },
+            ProxyConfig(),
+            self.store,
+        )
+        system_message = next(
+            message
+            for message in prepared.payload["messages"]
+            if message.get("role") == "system"
+            and isinstance(message.get("content"), str)
+            and "rules" in message["content"]
+        )
+        self.assertEqual(
+            system_message["content"],
+            "rules\n[image_url 已由 DeepSeek 文本代理省略]",
+        )
+
+    def test_vision_off_forces_placeholder_for_vision_model(self) -> None:
+        prepared = prepare_upstream_request(
+            self._image_message("deepseek-flash"),
+            ProxyConfig(vision="off"),
+            self.store,
+        )
+        self.assertFalse(prepared.vision_enabled)
+        self.assertEqual(
+            self._user_message(prepared)["content"],
+            "看看这张图\n[image_url 已由 DeepSeek 文本代理省略]",
+        )
+
+    def test_vision_on_forces_images_for_text_model(self) -> None:
+        prepared = prepare_upstream_request(
+            self._image_message("deepseek-v4-pro"),
+            ProxyConfig(vision="on"),
+            self.store,
+        )
+        self.assertTrue(prepared.vision_enabled)
+        content = self._user_message(prepared)["content"]
+        self.assertIsInstance(content, list)
+        self.assertEqual(content[1]["type"], "image_url")
+
+    def test_text_model_keeps_placeholder_by_default(self) -> None:
+        prepared = prepare_upstream_request(
+            self._image_message("deepseek-v4-pro"),
+            ProxyConfig(),
+            self.store,
+        )
+        self.assertFalse(prepared.vision_enabled)
+        self.assertEqual(
+            self._user_message(prepared)["content"],
+            "看看这张图\n[image_url 已由 DeepSeek 文本代理省略]",
+        )
+
+    def test_count_image_parts_counts_user_message_images(self) -> None:
+        messages = [
+            {"role": "system", "content": "rules"},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "hi"},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64,AAAA"},
+                    },
+                    {"type": "input_image", "image_url": "https://example.com/a.png"},
+                ],
+            },
+            {"role": "user", "content": "plain"},
+        ]
+        self.assertEqual(count_image_parts(messages), 2)
 
 
 class RequestPreparationTests(unittest.TestCase):

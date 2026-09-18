@@ -18,7 +18,12 @@ from urllib.request import Request, urlopen
 from deepseek_cursor_proxy.config import ProxyConfig
 from deepseek_cursor_proxy.reasoning_store import ReasoningStore
 from deepseek_cursor_proxy.server import DeepSeekProxyHandler, DeepSeekProxyServer
-from deepseek_cursor_proxy.trace import TraceWriter
+from deepseek_cursor_proxy.trace import (
+    MAX_INLINE_DATA_URI_CHARS,
+    TraceWriter,
+    redact_inline_data_uris,
+    sha256_text,
+)
 
 
 class TraceWriterUnitTests(unittest.TestCase):
@@ -69,6 +74,81 @@ class TraceWriterUnitTests(unittest.TestCase):
                 payload["request"]["headers"]["Authorization"]["present"], True
             )
             self.assertIn("sha256", payload["request"]["headers"]["Authorization"])
+
+
+class RedactInlineDataUriTests(unittest.TestCase):
+    """超长 data: URL（图片 base64）只在日志/落盘副本中被截断。"""
+
+    def test_long_data_uri_is_truncated_with_digest(self) -> None:
+        data_uri = "data:image/png;base64," + "A" * (MAX_INLINE_DATA_URI_CHARS * 2)
+        redacted = redact_inline_data_uris(data_uri)
+
+        self.assertTrue(redacted.startswith("data:image/png;base64,"))
+        self.assertIn("已省略", redacted)
+        self.assertIn(f"sha256={sha256_text(data_uri)[:12]}", redacted)
+        self.assertLess(len(redacted), len(data_uri))
+
+    def test_short_data_uri_and_plain_text_are_untouched(self) -> None:
+        short = "data:image/png;base64,AAAA"
+        plain = "x" * (MAX_INLINE_DATA_URI_CHARS * 2)
+        self.assertEqual(redact_inline_data_uris(short), short)
+        self.assertEqual(redact_inline_data_uris(plain), plain)
+
+    def test_nested_structures_are_redacted_without_mutating_input(self) -> None:
+        long_uri = "data:image/jpeg;base64," + "B" * (MAX_INLINE_DATA_URI_CHARS * 2)
+        payload = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "hi"},
+                        {"type": "image_url", "image_url": {"url": long_uri}},
+                    ],
+                }
+            ]
+        }
+
+        redacted = redact_inline_data_uris(payload)
+
+        redacted_url = redacted["messages"][0]["content"][1]["image_url"]["url"]
+        self.assertIn("已省略", redacted_url)
+        # 原始请求体必须保持不变，才能安全转发给上游。
+        self.assertEqual(
+            payload["messages"][0]["content"][1]["image_url"]["url"], long_uri
+        )
+
+    def test_non_string_scalars_pass_through(self) -> None:
+        self.assertEqual(redact_inline_data_uris(42), 42)
+        self.assertIsNone(redact_inline_data_uris(None))
+
+    def test_traced_body_does_not_persist_full_base64(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            writer = TraceWriter(temp_dir)
+            trace = writer.start_request(
+                method="POST",
+                path="/v1/chat/completions",
+                client_address="127.0.0.1",
+                headers={"User-Agent": "Cursor/1.0"},
+            )
+            long_uri = "data:image/png;base64," + "C" * (MAX_INLINE_DATA_URI_CHARS * 4)
+            trace.record_cursor_body(
+                {
+                    "model": "deepseek-flash",
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "image_url", "image_url": {"url": long_uri}},
+                            ],
+                        }
+                    ],
+                }
+            )
+            trace.finish("completed", http_status=200)
+
+            serialized = trace.path.read_text(encoding="utf-8")
+            self.assertIn("已省略", serialized)
+            self.assertNotIn("C" * (MAX_INLINE_DATA_URI_CHARS * 2), serialized)
 
 
 # ---------------------------------------------------------------------------
