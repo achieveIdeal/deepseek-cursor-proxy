@@ -176,6 +176,40 @@ def portable_reasoning_keys(
     return keys
 
 
+def namespace_fallback_keys(
+    message: dict[str, Any],
+    cache_namespace: str,
+) -> list[str]:
+    """不依赖 scope/turn 的兜底键，始终带 namespace 前缀。
+
+    Cursor 会改写更早的 system/user 前缀（压缩、切模式、注入规则），
+    scope 与 turn 哈希随之变化，精确键全部 miss，只有 `tool_call_id`
+    这类稳定字段还能用。旧版把这些兜底键写成不带 namespace 的
+    `scope:` 形式，导致「后缀匹配」无法区分用户：另一个 API key 刚缓存过
+    的同 id 工具调用会被注入到当前会话。
+
+    这些键把 namespace 放进键名，既保留历史前缀被改写后的兜底能力，
+    又让 `_get_unique_by_key_suffix` 能按 namespace 过滤。
+    """
+    if not cache_namespace:
+        return []
+    keys = [f"namespace:{cache_namespace}:signature:{message_signature(message)}"]
+    keys.extend(
+        f"namespace:{cache_namespace}:tool_call:{tool_call_id}"
+        for tool_call_id in tool_call_ids(message)
+    )
+    keys.extend(
+        f"namespace:{cache_namespace}:tool_call_signature:{tool_call_signature(tool_call)}"
+        for tool_call in (message.get("tool_calls") or [])
+        if isinstance(tool_call, dict)
+    )
+    keys.extend(
+        f"namespace:{cache_namespace}:tool_name:{tool_name}"
+        for tool_name in tool_call_names(message)
+    )
+    return keys
+
+
 class ReasoningStore:
     def __init__(
         self,
@@ -237,14 +271,19 @@ class ReasoningStore:
                         (key[::-1], key),
                     )
 
-        # 索引：加速按时间排序的淘汰和反向键前缀搜索
+        # 索引：加速按时间排序的淘汰和反向键前缀搜索。
+        # LIKE 默认大小写不敏感，只有 NOCASE 索引才能让
+        # `key_reversed LIKE 'prefix%'` 走索引；BINARY 索引会退化为
+        # 每次都全表扫描几百 MB 的缓存表。
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_rc_created_at "
             "ON reasoning_cache(created_at)"
         )
+        # 迁移旧版本创建的 BINARY 索引：它无法用于 LIKE，只会占用空间。
+        self._conn.execute("DROP INDEX IF EXISTS idx_rc_key_reversed")
         self._conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_rc_key_reversed "
-            "ON reasoning_cache(key_reversed)"
+            "CREATE INDEX IF NOT EXISTS idx_rc_key_reversed_nocase "
+            "ON reasoning_cache(key_reversed COLLATE NOCASE)"
         )
         self._conn.commit()
 
@@ -402,7 +441,9 @@ class ReasoningStore:
                 self._conn.commit()
             return str(row[0])
 
-    def get_by_tool_call_id(self, tool_call_id: str) -> str | None:
+    def get_by_tool_call_id(
+        self, tool_call_id: str, namespace: str = ""
+    ) -> str | None:
         """Last-resort lookup when conversation scope/turn hashes no longer match.
 
         Cursor may rewrite earlier system/user prefixes (compaction, mode switch,
@@ -410,40 +451,70 @@ class ReasoningStore:
         keys then miss even though the reasoning row is still in SQLite under the
         old hash. Match on the stable `:tool_call:{id}` suffix instead.
 
-        Only returns a value when every matching row shares the same reasoning
-        text. Concurrent chats that reuse a tool_call_id with different reasoning
-        stay ambiguous and are not cross-wired.
+        Only returns a value when every matching row in the same namespace shares
+        the same reasoning text. Concurrent chats that reuse a tool_call_id with
+        different reasoning stay ambiguous and are not cross-wired.
         """
         if not tool_call_id:
             return None
-        return self._get_unique_by_key_suffix(f":tool_call:{tool_call_id}")
+        if namespace:
+            # 优先命中 namespace_fallback_keys 写入的精确键：键名自带
+            # namespace，既无跨用户风险，也省掉一次后缀 LIKE 扫描。
+            precise = self.get(f"namespace:{namespace}:tool_call:{tool_call_id}")
+            if precise is not None:
+                return precise
+        return self._get_unique_by_key_suffix(
+            f":tool_call:{tool_call_id}", namespace
+        )
 
-    def get_by_message_signature(self, signature: str) -> str | None:
+    def get_by_message_signature(
+        self, signature: str, namespace: str = ""
+    ) -> str | None:
         """Like get_by_tool_call_id, but for assistants without tool_call ids."""
         if not signature:
             return None
-        return self._get_unique_by_key_suffix(f":signature:{signature}")
+        if namespace:
+            precise = self.get(f"namespace:{namespace}:signature:{signature}")
+            if precise is not None:
+                return precise
+        return self._get_unique_by_key_suffix(f":signature:{signature}", namespace)
 
-    def _get_unique_by_key_suffix(self, suffix: str) -> str | None:
+    def _get_unique_by_key_suffix(
+        self, suffix: str, namespace: str = ""
+    ) -> str | None:
         """通过 key 后缀查找唯一 reasoning。
 
-        使用 key_reversed 列将后缀搜索转为前缀搜索，
-        从而利用 idx_rc_key_reversed 索引，避免全表扫描。
+        使用 key_reversed 列将后缀搜索转为前缀搜索，并依赖
+        idx_rc_key_reversed_nocase（LIKE 大小写不敏感）走索引，
+        避免在几百 MB 的缓存表上全表扫描。
+
+        这里刻意不加 ORDER BY created_at：结果语义只关心命中的键是否
+        共享同一 reasoning，顺序无关，而排序会让查询优化器放弃前缀索引、
+        改用 created_at 索引逐行过滤，重新退化为全表扫描。
+
+        后缀匹配本身不带 namespace，必须在 Python 侧按
+        `namespace:{namespace}:` 前缀过滤：否则另一个 API key（另一个用户）
+        刚缓存过的同 id 工具调用会被注入到当前会话，造成 reasoning 串台。
+        由于调用方总是会算出非空 namespace，旧版本写入的 `scope:` 前缀
+        兜底键（键名里没有 namespace）不再参与匹配；它们会被
+        `namespace_fallback_keys` 写入的新键逐步替代。
         """
         reversed_suffix = suffix[::-1]
+        namespace_prefix = f"namespace:{namespace}:" if namespace else ""
         with self._lock:
             rows = self._conn.execute(
                 """
                 SELECT key, reasoning FROM reasoning_cache
                 WHERE key_reversed LIKE ?
-                ORDER BY created_at DESC
                 """,
                 (reversed_suffix + "%",),
             ).fetchall()
             # key_reversed LIKE 'reversed_suffix%' 精确等价于
             # key LIKE '%suffix'，无需额外的 Python endswith 过滤
             matched: list[tuple[str, str]] = [
-                (str(key), str(reasoning)) for key, reasoning in rows
+                (str(key), str(reasoning))
+                for key, reasoning in rows
+                if not namespace_prefix or str(key).startswith(namespace_prefix)
             ]
             if not matched:
                 return None
@@ -475,6 +546,7 @@ class ReasoningStore:
             return 0
 
         keys = scoped_reasoning_keys(message, scope)
+        keys.extend(namespace_fallback_keys(message, cache_namespace))
         if prior_messages is not None:
             keys.extend(
                 portable_reasoning_keys(message, cache_namespace, prior_messages)
@@ -495,6 +567,7 @@ class ReasoningStore:
         prior_messages: list[dict[str, Any]] | None = None,
     ) -> str | None:
         keys = scoped_reasoning_keys(message, scope)
+        keys.extend(namespace_fallback_keys(message, cache_namespace))
         if prior_messages is not None:
             keys.extend(
                 portable_reasoning_keys(message, cache_namespace, prior_messages)
@@ -514,7 +587,10 @@ class ReasoningStore:
     ) -> int:
         if not isinstance(reasoning, str):
             return 0
-        keys = portable_reasoning_keys(message, cache_namespace, prior_messages)
+        keys = namespace_fallback_keys(message, cache_namespace)
+        keys.extend(
+            portable_reasoning_keys(message, cache_namespace, prior_messages)
+        )
         if not keys:
             return 0
         message_with_reasoning = dict(message)

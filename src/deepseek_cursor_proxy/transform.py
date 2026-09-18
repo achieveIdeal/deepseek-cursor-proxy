@@ -410,7 +410,9 @@ def normalize_message(
                             break
                     if not patched:
                         for tool_call_id in tool_call_ids(normalized):
-                            restored = store.get_by_tool_call_id(tool_call_id)
+                            restored = store.get_by_tool_call_id(
+                                tool_call_id, cache_namespace
+                            )
                             if restored is not None:
                                 hit_kind = "tool_call_id_fallback"
                                 normalized["reasoning_content"] = restored
@@ -441,7 +443,9 @@ def normalize_message(
                                 break
                     if not patched:
                         signature = message_signature(normalized)
-                        restored = store.get_by_message_signature(signature)
+                        restored = store.get_by_message_signature(
+                            signature, cache_namespace
+                        )
                         if restored is not None:
                             hit_kind = "message_signature_fallback"
                             normalized["reasoning_content"] = restored

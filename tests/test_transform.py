@@ -900,11 +900,14 @@ class StopMidStreamingToolCallTests(unittest.TestCase):
             "reasoning_content": "Need git status before editing.",
             "tool_calls": [tool_call],
         }
-        # Store only under the original scope — portable turn keys also miss
-        # because the rewritten user message changes turn_context_signature.
+        # Store only under the original scope. 兜底命中依赖写入时一起落库的
+        # `namespace:{ns}:tool_call:{id}` 键：它不含 scope/turn，所以历史
+        # 前缀被改写后仍然有效，且键名自带 namespace 不会跨用户串台。
+        namespace = _default_cache_namespace()
         self.store.store_assistant_message(
             assistant,
-            conversation_scope(original_prior, _default_cache_namespace()),
+            conversation_scope(original_prior, namespace),
+            namespace,
         )
 
         prepared = prepare_upstream_request(

@@ -128,7 +128,14 @@ class StrictFakeDeepSeek(BaseHTTPRequestHandler):
         last_user = _last_index(messages, "user")
         last_tool = _last_index(messages, "tool")
         last_assistant = _last_index(messages, "assistant")
-        if last_user == 0 and last_assistant == -1 and last_tool == -1:
+        # 代理会注入语言指令 system 消息，首轮不再保证 user 位于 index 0；
+        # 这里按语义判断：除开头的 system 之外只剩一条 user。
+        non_system_roles = [
+            message.get("role")
+            for message in messages
+            if isinstance(message, dict) and message.get("role") != "system"
+        ]
+        if non_system_roles == ["user"]:
             return self._send(
                 200,
                 _completion(
@@ -262,13 +269,18 @@ def _start_proxy(
     **config_overrides: Any,
 ) -> _Fixture:
     proxy = DeepSeekProxyServer(("127.0.0.1", 0), DeepSeekProxyHandler)
+    # 默认关闭 response_language 注入：注入会在消息列表最前面加一条 system，
+    # 让这些聚焦缓存/推理回放的协议测试的消息索引整体错位。
+    # 注入行为本身由 test_transform.py 的专门用例覆盖。
+    overrides: dict[str, Any] = {"response_language": None}
+    overrides.update(config_overrides)
     proxy.config = ProxyConfig(
         upstream_base_url=upstream_url,
         upstream_model="deepseek-v4-pro",
         ngrok=False,
         verbose=False,
         cors=False,
-        **config_overrides,
+        **overrides,
     )
     proxy.reasoning_store = store
     return _Fixture(proxy)
@@ -773,7 +785,14 @@ class _StreamingThenJsonHandler(BaseHTTPRequestHandler):
 
         # Non-streaming follow-up: enforce that proxy patched the prior
         # streamed reasoning_content into history.
-        assistant = payload["messages"][1]
+        assistant = next(
+            (
+                message
+                for message in payload["messages"]
+                if message.get("role") == "assistant"
+            ),
+            {},
+        )
         if assistant.get("reasoning_content") != THINKING_1_1:
             self._send(400, {"error": {"message": "missing streamed reasoning"}})
             return
@@ -1251,10 +1270,15 @@ class _SlowToolStreamHandler(BaseHTTPRequestHandler):
 
         # Non-streaming follow-up.
         messages = payload.get("messages") or []
-        if (
-            len(messages) >= 2
-            and messages[1].get("reasoning_content") == "Streamed tool reasoning."
-        ):
+        assistant = next(
+            (
+                message
+                for message in messages
+                if message.get("role") == "assistant"
+            ),
+            {},
+        )
+        if assistant.get("reasoning_content") == "Streamed tool reasoning.":
             self._send(
                 200,
                 _completion(
