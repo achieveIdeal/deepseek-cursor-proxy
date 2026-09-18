@@ -17,6 +17,7 @@ import json
 import logging
 from pathlib import Path
 import re
+import socket
 import threading
 import time
 from types import SimpleNamespace
@@ -76,6 +77,27 @@ class _FailingStreamingResponse:
 
     def readline(self) -> bytes:
         raise OSError("record layer failure")
+
+
+class _DelayedStreamingResponse:
+    """第一行延迟返回，用来制造上游静默期（触发 keep-alive）。"""
+
+    status = 200
+    headers = {"Content-Type": "text/event-stream"}
+
+    def __init__(self, lines: list[bytes], first_delay: float = 0.0) -> None:
+        self._lines = lines
+        self._first_delay = first_delay
+        self._first = True
+
+    def readline(self) -> bytes:
+        if self._first:
+            self._first = False
+            if self._first_delay:
+                time.sleep(self._first_delay)
+        if not self._lines:
+            return b""
+        return self._lines.pop(0)
 
 
 class _BrokenPipeWfile:
@@ -300,7 +322,8 @@ class HandlerStubTests(unittest.TestCase):
         finally:
             handler.server.reasoning_store.close()
         self.assertFalse(result.sent)
-        self.assertEqual(response.readline_calls, 1)
+        # 后台读取线程可能在断言前又推进了一次读取，只要求至少读过一次。
+        self.assertGreaterEqual(response.readline_calls, 1)
         self.assertIn("发送流式响应块", "\n".join(captured.output))
 
     def test_streaming_response_handles_upstream_read_failure(self) -> None:
@@ -319,6 +342,108 @@ class HandlerStubTests(unittest.TestCase):
         self.assertIn(
             "读取上游流式响应失败", "\n".join(captured.output)
         )
+
+    def test_streaming_response_sends_keep_alive_while_upstream_idles(self) -> None:
+        """上游静默时（DeepSeek 思考中）必须向客户端发注释行保活，
+        否则 Cloudflare 之类的中间链路会按空闲超时掐断流。"""
+        wfile = BytesIO()
+        handler = _make_handler_stub(wfile, stream_idle_ping_seconds=0.02)
+        chunk = {
+            "id": "stream",
+            "model": "deepseek-v4-pro",
+            "choices": [{"index": 0, "delta": {"content": "hi"}}],
+        }
+        response = _DelayedStreamingResponse(
+            [
+                f"data: {json.dumps(chunk)}\n\n".encode("utf-8"),
+                b"data: [DONE]\n\n",
+            ],
+            first_delay=0.15,
+        )
+        try:
+            result = handler._proxy_streaming_response(
+                response,
+                "deepseek-v4-pro",
+                [{"role": "user", "content": "hi"}],
+                "ns",
+            )
+        finally:
+            handler.server.reasoning_store.close()
+        body = wfile.getvalue().decode("utf-8")
+        self.assertTrue(result.sent)
+        self.assertIn(": keep-alive\n\n", body)
+        self.assertIn('"content":"hi"', body)
+        self.assertIn("data: [DONE]", body)
+
+    def test_streaming_response_appends_abort_tail_when_done_is_missing(self) -> None:
+        """上游在 [DONE] 之前断流时，必须补一个结束帧，
+        让 Cursor 结束这一轮而不是一直等。"""
+        wfile = BytesIO()
+        handler = _make_handler_stub(wfile)
+        chunk = {
+            "id": "stream",
+            "model": "deepseek-v4-pro",
+            "choices": [{"index": 0, "delta": {"content": "hi"}}],
+        }
+        response = _FakeStreamingResponse(
+            [f"data: {json.dumps(chunk)}\n\n".encode("utf-8")]
+        )
+        try:
+            with self.assertLogs("deepseek_cursor_proxy", level="WARNING"):
+                result = handler._proxy_streaming_response(
+                    response,
+                    "deepseek-v4-pro",
+                    [{"role": "user", "content": "hi"}],
+                    "ns",
+                )
+        finally:
+            handler.server.reasoning_store.close()
+        body = wfile.getvalue().decode("utf-8")
+        self.assertTrue(result.aborted)
+        self.assertIn('"finish_reason":"stop"', body)
+        self.assertIn("data: [DONE]", body)
+
+    def test_streaming_abort_reports_error_when_tool_call_is_incomplete(self) -> None:
+        """工具调用参数可能残缺时不能伪装成正常结束，否则 Cursor 会执行
+        一个参数不完整的工具调用。"""
+        wfile = BytesIO()
+        handler = _make_handler_stub(wfile)
+        chunk = {
+            "id": "stream",
+            "model": "deepseek-v4-pro",
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {"name": "read_file", "arguments": "{"},
+                            }
+                        ]
+                    },
+                }
+            ],
+        }
+        response = _FakeStreamingResponse(
+            [f"data: {json.dumps(chunk)}\n\n".encode("utf-8")]
+        )
+        try:
+            with self.assertLogs("deepseek_cursor_proxy", level="WARNING"):
+                result = handler._proxy_streaming_response(
+                    response,
+                    "deepseek-v4-pro",
+                    [{"role": "user", "content": "hi"}],
+                    "ns",
+                )
+        finally:
+            handler.server.reasoning_store.close()
+        body = wfile.getvalue().decode("utf-8")
+        self.assertTrue(result.aborted)
+        self.assertIn("upstream_stream_aborted", body)
+        self.assertIn("data: [DONE]", body)
 
     def test_collapsible_reasoning_no_effect_when_display_disabled(self) -> None:
         wfile = BytesIO()
@@ -541,6 +666,81 @@ class HttpBoundaryTests(unittest.TestCase):
             body = response.read().decode("utf-8")
         self.assertLess(time.monotonic() - started, 1.0)
         self.assertIn("data: [DONE]", body)
+
+    def _open_keep_alive_socket(self) -> socket.socket:
+        host, port = self.proxy.server.server_address
+        return socket.create_connection((host, port), timeout=5)
+
+    @staticmethod
+    def _read_one_response(sock: socket.socket) -> bytes:
+        """按 Content-Length 读一个完整响应，模拟 keep-alive 客户端。"""
+        buffer = b""
+        while b"\r\n\r\n" not in buffer:
+            data = sock.recv(65536)
+            if not data:
+                return buffer
+            buffer += data
+        head, rest = buffer.split(b"\r\n\r\n", 1)
+        length = 0
+        for line in head.split(b"\r\n"):
+            name, _, value = line.partition(b":")
+            if name.strip().lower() == b"content-length":
+                length = int(value.strip())
+        while len(rest) < length:
+            data = sock.recv(65536)
+            if not data:
+                break
+            rest += data
+        return head + b"\r\n\r\n" + rest
+
+    def test_serves_two_requests_on_one_keep_alive_connection(self) -> None:
+        """HTTP/1.1 的意义之一：Cursor 复用同一条连接，代理必须能连续处理。"""
+        host, port = self.proxy.server.server_address
+        payload = json.dumps(self._request()).encode("utf-8")
+        head = (
+            f"POST /v1/chat/completions HTTP/1.1\r\n"
+            f"Host: {host}:{port}\r\n"
+            "Authorization: Bearer sk-test\r\n"
+            "Content-Type: application/json\r\n"
+            f"Content-Length: {len(payload)}\r\n"
+            "\r\n"
+        ).encode("utf-8")
+        with self._open_keep_alive_socket() as sock:
+            sock.sendall(head + payload)
+            first = self._read_one_response(sock)
+            sock.sendall(head + payload)
+            second = self._read_one_response(sock)
+        self.assertTrue(first.startswith(b"HTTP/1.1 200"), first[:40])
+        self.assertTrue(second.startswith(b"HTTP/1.1 200"), second[:40])
+        self.assertEqual(len(_PlainFakeUpstream.requests), 2)
+
+    def test_accepts_chunked_request_body(self) -> None:
+        """Cursor 的部分 HTTP 栈用 chunked 上传；只认 Content-Length
+        会让这类请求变成"请求体为空"并污染连接。"""
+        host, port = self.proxy.server.server_address
+        body = json.dumps(self._request()).encode("utf-8")
+        chunked = b""
+        for offset in range(0, len(body), 16):
+            piece = body[offset : offset + 16]
+            chunked += f"{len(piece):x}\r\n".encode("utf-8") + piece + b"\r\n"
+        chunked += b"0\r\n\r\n"
+        head = (
+            "POST /v1/chat/completions HTTP/1.1\r\n"
+            f"Host: {host}:{port}\r\n"
+            "Authorization: Bearer sk-test\r\n"
+            "Content-Type: application/json\r\n"
+            "Transfer-Encoding: chunked\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+        ).encode("utf-8")
+        with self._open_keep_alive_socket() as sock:
+            sock.sendall(head + chunked)
+            response = self._read_one_response(sock)
+        self.assertTrue(response.startswith(b"HTTP/1.1 200"), response[:80])
+        # 代理会在最前面注入思考/语言指令，因此断言最后一条 user 消息。
+        self.assertEqual(
+            _PlainFakeUpstream.requests[0]["messages"][-1]["content"], "hi"
+        )
 
     def test_normal_logging_summarizes_without_bodies_or_keys(self) -> None:
         with self.assertLogs("deepseek_cursor_proxy", level="INFO") as captured:

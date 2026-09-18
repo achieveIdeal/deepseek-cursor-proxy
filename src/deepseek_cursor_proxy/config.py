@@ -27,6 +27,7 @@ DEFAULT_NGROK = True
 DEFAULT_VERBOSE = False
 DEFAULT_REQUEST_TIMEOUT = 300.0
 DEFAULT_MAX_REQUEST_BODY_BYTES = 20 * 1024 * 1024
+DEFAULT_STREAM_IDLE_PING_SECONDS = 15.0
 DEFAULT_CORS = False
 DEFAULT_MISSING_REASONING_STRATEGY = "recover"
 DEFAULT_REASONING_CACHE_MAX_AGE_SECONDS = 30 * 24 * 60 * 60
@@ -53,6 +54,9 @@ ngrok: {str(DEFAULT_NGROK).lower()}
 verbose: {str(DEFAULT_VERBOSE).lower()}
 request_timeout: {DEFAULT_REQUEST_TIMEOUT:g}
 max_request_body_bytes: {DEFAULT_MAX_REQUEST_BODY_BYTES}
+# 上游流静默超过该秒数时，向客户端发送 SSE keep-alive 注释行，
+# 防止 Cloudflare/Nginx 等中间链路的空闲超时掐断流式响应；设为 0 关闭。
+stream_idle_ping_seconds: {DEFAULT_STREAM_IDLE_PING_SECONDS:g}
 cors: {str(DEFAULT_CORS).lower()}
 
 reasoning_content_path: {REASONING_CONTENT_FILE_NAME}
@@ -217,6 +221,7 @@ class ProxyConfig:
     reasoning_effort: str = DEFAULT_REASONING_EFFORT
     request_timeout: float = DEFAULT_REQUEST_TIMEOUT
     max_request_body_bytes: int = DEFAULT_MAX_REQUEST_BODY_BYTES
+    stream_idle_ping_seconds: float = DEFAULT_STREAM_IDLE_PING_SECONDS
     reasoning_content_path: Path = field(default_factory=default_reasoning_content_path)
     missing_reasoning_strategy: str = DEFAULT_MISSING_REASONING_STRATEGY
     reasoning_cache_max_age_seconds: int = DEFAULT_REASONING_CACHE_MAX_AGE_SECONDS
@@ -267,6 +272,10 @@ class ProxyConfig:
             max_request_body_bytes=as_int(
                 setting_value(settings, "max_request_body_bytes"),
                 DEFAULT_MAX_REQUEST_BODY_BYTES,
+            ),
+            stream_idle_ping_seconds=as_float(
+                setting_value(settings, "stream_idle_ping_seconds"),
+                DEFAULT_STREAM_IDLE_PING_SECONDS,
             ),
             reasoning_content_path=as_path(
                 setting_value(settings, "reasoning_content_path"),

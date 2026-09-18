@@ -7,7 +7,11 @@ from http.client import HTTPException
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+import queue
+import socket
+import sqlite3
 import sys
+import threading
 import time
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -32,6 +36,7 @@ from .trace import TraceRequest, TraceWriter
 from .tunnel import NgrokTunnel, local_tunnel_target
 from .transform import (
     RECOVERY_NOTICE_CONTENT,
+    PreparedRequest,
     prepare_upstream_request,
     rewrite_response_body,
 )
@@ -41,10 +46,101 @@ class RequestBodyTooLarge(ValueError):
     pass
 
 
+# SSE 注释行：所有符合规范的 SSE 客户端都会忽略它，
+# 但 Cloudflare/Nginx 等中间链路会因此认为连接仍在传输数据。
+SSE_KEEP_ALIVE_BYTES = b": keep-alive\n\n"
+
+
 @dataclass
 class ProxyResponseResult:
     sent: bool
     usage: dict[str, Any] | None = None
+    # 上游流在结束前中断（读取失败或未收到 [DONE] 就 EOF）。
+    aborted: bool = False
+
+
+class UpstreamLineReader:
+    """在后台线程逐行读取上游 SSE。
+
+    主线程因此可以在上游静默时用 poll() 超时，向客户端发送 keep-alive
+    注释行，而不是阻塞在 readline 上直到 Cloudflare/Nginx 之类的
+    中间链路把空闲连接掐断。
+    """
+
+    def __init__(self, response: Any) -> None:
+        self._response = response
+        self._queue: queue.Queue[bytes | BaseException | None] = queue.Queue()
+        self._stop = threading.Event()
+        self.last_error: BaseException | None = None
+        self._thread = threading.Thread(
+            target=self._run,
+            name="deepseek-proxy-upstream-reader",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                line = self._response.readline()
+            except BaseException as exc:  # noqa: BLE001 - 读线程不能把异常丢给解释器
+                self.last_error = exc
+                self._queue.put(exc)
+                return
+            if not line:
+                self._queue.put(None)
+                return
+            self._queue.put(line)
+
+    def poll(self, timeout: float | None) -> tuple[str, bytes | None]:
+        """返回 (kind, line)，kind 为 line/eof/error/timeout。"""
+        try:
+            if timeout is None:
+                item = self._queue.get()
+            elif timeout <= 0:
+                item = self._queue.get_nowait()
+            else:
+                item = self._queue.get(timeout=timeout)
+        except queue.Empty:
+            return "timeout", None
+        if item is None:
+            return "eof", None
+        if isinstance(item, BaseException):
+            return "error", None
+        return "line", item
+
+    def error_text(self) -> str:
+        if self.last_error is None:
+            return "未知错误"
+        return f"{type(self.last_error).__name__}: {self.last_error}"
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def shutdown(self) -> None:
+        """停止读取，并让阻塞中的读取线程立刻返回。
+
+        不能只调 response.close()：http.client 的响应体是带锁的
+        BufferedReader，close() 要等正在 read 的线程（也就是本类的读取线程）
+        释放缓冲锁；而上游若在 [DONE] 之后仍保持连接不关，readline 会一直
+        阻塞，主线程就卡在关闭上游这一步，客户端也就迟迟等不到流结束。
+        这里关掉底层 SocketIO（不经过 BufferedReader 的锁），让阻塞的
+        recv 立刻失败返回。
+        """
+        self._stop.set()
+        raw = getattr(getattr(self._response, "fp", None), "raw", None)
+        if raw is None:
+            return
+        sock = getattr(raw, "_sock", None)
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+        try:
+            raw.close()
+        except OSError:
+            pass
 
 
 class DeepSeekProxyServer(ThreadingHTTPServer):
@@ -52,9 +148,16 @@ class DeepSeekProxyServer(ThreadingHTTPServer):
     reasoning_store: ReasoningStore
     trace_writer: TraceWriter | None
 
+    # Cursor 的代理模式可能并发多个请求；默认 backlog 只有 5，
+    # 连接高峰期会导致新连接被拒或长时间排队。
+    request_queue_size = 128
+    daemon_threads = True
+
 
 class DeepSeekProxyHandler(BaseHTTPRequestHandler):
     server_version = "DeepSeekPythonProxy/0.1"
+    # 默认 HTTP/1.0 无法表达 chunked，且中间层对 1.0 流式响应的缓冲策略不一致。
+    protocol_version = "HTTP/1.1"
 
     @property
     def config(self) -> ProxyConfig:
@@ -94,9 +197,39 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
         self._send_json(404, {"error": {"message": "未找到"}})
 
     def do_POST(self) -> None:
+        try:
+            self._handle_post()
+        except (BrokenPipeError, ConnectionError) as exc:
+            LOG.warning("客户端连接中断: %s", exc)
+            self.close_connection = True
+            self._finish_trace(
+                getattr(self, "_current_trace", None),
+                "client_disconnected",
+                reason=str(exc),
+            )
+        except Exception as exc:  # noqa: BLE001
+            # 缓存故障、解析缺陷等未预期异常不应让 Cursor 只看到断流。
+            LOG.exception("处理 POST 请求时发生未预期错误: %s", exc)
+            trace = getattr(self, "_current_trace", None)
+            if not getattr(self, "_headers_sent", False):
+                try:
+                    self._send_json(
+                        500,
+                        {"error": {"message": "代理内部错误，请查看代理终端日志"}},
+                        trace=trace,
+                    )
+                except (BrokenPipeError, ConnectionError, OSError):
+                    pass
+                self._finish_trace(trace, "internal_error", http_status=500)
+            else:
+                self.close_connection = True
+                self._finish_trace(trace, "internal_error", reason=str(exc))
+
+    def _handle_post(self) -> None:
         started = time.monotonic()
         request_path = urlparse(self.path).path
         trace = self._start_trace(request_path)
+        self._current_trace = trace
         if self.config.verbose:
             LOG.info(
                 "收到 POST %s，来自 %s content_length=%s user_agent=%s",
@@ -137,6 +270,7 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                 "拒绝请求 path=%s status=413 reason=%s", request_path, exc
             )
             self._send_json(413, {"error": {"message": str(exc)}}, trace=trace)
+            self._drain_after_rejection()
             self._finish_trace(trace, "rejected", http_status=413, reason=str(exc))
             return
         except ValueError as exc:
@@ -144,6 +278,8 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                 "拒绝请求 path=%s status=400 reason=%s", request_path, exc
             )
             self._send_json(400, {"error": {"message": str(exc)}}, trace=trace)
+            if self.close_connection:
+                self._drain_after_rejection()
             self._finish_trace(trace, "rejected", http_status=400, reason=str(exc))
             return
 
@@ -155,12 +291,14 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
 
         log_cursor_request(payload, self.config)
 
-        prepared = prepare_upstream_request(
+        prepared = self._prepare_upstream_request_safely(
             payload,
-            self.config,
-            self.reasoning_store,
-            authorization=cursor_authorization,
+            cursor_authorization,
+            request_path,
+            trace,
         )
+        if prepared is None:
+            return
         if trace is not None:
             trace.record_transform(prepared)
         log_context_summary(prepared)
@@ -324,7 +462,11 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                     spinner.stop()
                     self._finish_trace(
                         trace,
-                        "client_disconnected",
+                        (
+                            "upstream_aborted"
+                            if sent_response.aborted
+                            else "client_disconnected"
+                        ),
                         http_status=upstream_status,
                         stream=upward_stream,
                     )
@@ -339,6 +481,44 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                 )
         finally:
             spinner.stop()
+
+    def _prepare_upstream_request_safely(
+        self,
+        payload: dict[str, Any],
+        cursor_authorization: str,
+        request_path: str,
+        trace: TraceRequest | None,
+    ) -> PreparedRequest | None:
+        """构造上游请求；缓存故障时降级为不注入 reasoning，而不是让请求失败。"""
+        try:
+            return prepare_upstream_request(
+                payload,
+                self.config,
+                self.reasoning_store,
+                authorization=cursor_authorization,
+            )
+        except sqlite3.Error as exc:
+            LOG.warning(
+                "访问 reasoning 缓存失败，降级为无缓存转发 path=%s: %s",
+                request_path,
+                exc,
+            )
+        try:
+            return prepare_upstream_request(
+                payload,
+                self.config,
+                None,
+                authorization=cursor_authorization,
+            )
+        except Exception as exc:  # noqa: BLE001
+            LOG.exception("构造上游请求失败 path=%s: %s", request_path, exc)
+            self._send_json(
+                500,
+                {"error": {"message": "代理内部错误，请查看代理终端日志"}},
+                trace=trace,
+            )
+            self._finish_trace(trace, "internal_error", http_status=500)
+            return None
 
     def _start_trace(self, request_path: str) -> TraceRequest | None:
         writer = self.trace_writer
@@ -429,6 +609,7 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
             for name, value in headers:
                 self.send_header(name, value)
             self.end_headers()
+            self._headers_sent = True
         except (BrokenPipeError, ConnectionError) as exc:
             LOG.warning("客户端断开连接（%s）: %s", disconnect_context, exc)
             return False
@@ -449,6 +630,42 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
             LOG.warning("客户端断开连接（%s）: %s", disconnect_context, exc)
             return False
         return True
+
+    def _drain_after_rejection(
+        self,
+        *,
+        timeout: float = 0.5,
+        max_bytes: int = 1024 * 1024,
+    ) -> None:
+        """拒绝请求后优雅收尾：半关写方向，再有界排空未读请求体。
+
+        HTTP/1.1 下带着未读数据直接关闭连接会让内核发 RST，客户端可能因此
+        丢掉刚写出的错误响应（Windows 上尤其常见）。这里先 shutdown(SHUT_WR)
+        让客户端能立刻读到响应结束，然后最多花 timeout 秒读掉残留请求体；
+        最坏情况是超时后照常关闭。
+        """
+        self.close_connection = True
+        try:
+            self.connection.shutdown(socket.SHUT_WR)
+        except OSError:
+            return
+        remaining = max_bytes
+        deadline = time.monotonic() + timeout
+        try:
+            self.connection.settimeout(0.05)
+            while remaining > 0 and time.monotonic() < deadline:
+                try:
+                    data = self.connection.recv(min(65536, remaining))
+                except OSError:
+                    break
+                if not data:
+                    break
+                remaining -= len(data)
+        finally:
+            try:
+                self.connection.settimeout(None)
+            except OSError:
+                pass
 
     def _send_models(self) -> None:
         created = int(time.time())
@@ -473,17 +690,7 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
         self._send_json(200, {"object": "list", "data": models})
 
     def _read_json_body(self) -> dict[str, Any]:
-        try:
-            length = int(self.headers.get("Content-Length") or 0)
-        except ValueError as exc:
-            raise ValueError("无效的 Content-Length") from exc
-        if length < 0:
-            raise ValueError("无效的 Content-Length")
-        if length > self.config.max_request_body_bytes:
-            raise RequestBodyTooLarge(
-                f"请求体过大；限制为 {self.config.max_request_body_bytes} 字节"
-            )
-        raw_body = self.rfile.read(length)
+        raw_body = self._read_request_body_bytes()
         if not raw_body:
             raise ValueError("请求体为空")
         try:
@@ -494,8 +701,95 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
             raise ValueError("请求体必须是 JSON 对象")
         return payload
 
+    def _read_request_body_bytes(self) -> bytes:
+        transfer_encoding = (self.headers.get("Transfer-Encoding") or "").lower()
+        if "chunked" in transfer_encoding:
+            return self._read_chunked_body()
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError as exc:
+            # 无法确定请求边界时不能复用连接。
+            self.close_connection = True
+            raise ValueError("无效的 Content-Length") from exc
+        if length < 0:
+            self.close_connection = True
+            raise ValueError("无效的 Content-Length")
+        if length == 0:
+            return b""
+        if length > self.config.max_request_body_bytes:
+            self.close_connection = True
+            raise RequestBodyTooLarge(
+                f"请求体过大；限制为 {self.config.max_request_body_bytes} 字节"
+            )
+        try:
+            return self.rfile.read(length)
+        except OSError as exc:
+            self.close_connection = True
+            raise ValueError(f"读取请求体失败: {exc}") from exc
+
+    def _read_chunked_body(self) -> bytes:
+        """按 RFC 9112 读取 chunked 请求体。
+
+        Cursor 的部分 HTTP 栈会用 chunked 上传，只认 Content-Length
+        会让这类请求变成空 body 并污染连接。
+        """
+        max_bytes = self.config.max_request_body_bytes
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            try:
+                size_line = self.rfile.readline(65536)
+            except OSError as exc:
+                self.close_connection = True
+                raise ValueError(f"读取请求体失败: {exc}") from exc
+            if not size_line:
+                self.close_connection = True
+                raise ValueError("请求体不完整（chunked 数据提前结束）")
+            size_token = size_line.split(b";", 1)[0].strip()
+            try:
+                size = int(size_token, 16)
+            except ValueError as exc:
+                self.close_connection = True
+                raise ValueError("无效的 chunked 大小") from exc
+            if size < 0:
+                self.close_connection = True
+                raise ValueError("无效的 chunked 大小")
+            if size == 0:
+                break
+            total += size
+            if total > max_bytes:
+                self.close_connection = True
+                raise RequestBodyTooLarge(
+                    f"请求体过大；限制为 {max_bytes} 字节"
+                )
+            try:
+                chunk = self.rfile.read(size)
+                terminator = self.rfile.read(2)
+            except OSError as exc:
+                self.close_connection = True
+                raise ValueError(f"读取请求体失败: {exc}") from exc
+            if len(chunk) != size or terminator != b"\r\n":
+                self.close_connection = True
+                raise ValueError("请求体不完整（chunked 数据提前结束）")
+            chunks.append(chunk)
+        # 消费 trailer 区（通常为空行）。
+        while True:
+            try:
+                trailer = self.rfile.readline(65536)
+            except OSError:
+                break
+            if trailer in (b"\r\n", b"\n", b""):
+                break
+        return b"".join(chunks)
+
     def _record_request_body_for_trace(self, trace: TraceRequest | None) -> None:
         if trace is None:
+            return
+        transfer_encoding = (self.headers.get("Transfer-Encoding") or "").lower()
+        if "chunked" in transfer_encoding:
+            # 拒绝路径不解析 chunked，连接不能复用。
+            trace.record_cursor_body_omitted(reason="chunked")
+            self.close_connection = True
             return
         try:
             length = int(self.headers.get("Content-Length") or 0)
@@ -593,7 +887,7 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                 display_reasoning=self.config.display_reasoning,
                 collapsible_reasoning=self.config.collapsible_reasoning,
             )
-        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        except (json.JSONDecodeError, UnicodeDecodeError, sqlite3.Error) as exc:
             LOG.warning("重写上游 JSON 响应失败: %s", exc)
 
         if self.config.verbose:
@@ -697,15 +991,37 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
             else [(scope, response_prior_messages)]
         )
         finalized = False
+        aborted = False
+        abort_reason: str | None = None
         pending_recovery_notice = recovery_notice
+        reader = UpstreamLineReader(response)
+        ping_seconds = self.config.stream_idle_ping_seconds
+        poll_timeout = ping_seconds if ping_seconds and ping_seconds > 0 else None
         try:
             while True:
-                try:
-                    line = response.readline()
-                except (HTTPException, OSError) as exc:
-                    LOG.warning("读取上游流式响应失败: %s", exc)
-                    return ProxyResponseResult(False, usage)
-                if not line:
+                kind, line = reader.poll(poll_timeout)
+                if kind == "timeout":
+                    # 上游仍在思考：发 SSE 注释行保活。它不会进入模型上下文，
+                    # 但能让 Cloudflare 等中间链路看到数据流动而不掐断连接。
+                    if not self._write_to_client(
+                        SSE_KEEP_ALIVE_BYTES, "发送 SSE keep-alive", flush=True
+                    ):
+                        return ProxyResponseResult(False, usage)
+                    continue
+                if kind == "eof":
+                    if not finalized:
+                        aborted = True
+                        abort_reason = "上游流未发送 [DONE] 就关闭了连接"
+                        LOG.warning(
+                            "上游流提前结束（未收到 [DONE]），已向客户端补发结束帧"
+                        )
+                    break
+                if kind == "error":
+                    aborted = True
+                    abort_reason = reader.error_text()
+                    LOG.warning("读取上游流式响应失败: %s", abort_reason)
+                    break
+                if line is None:  # pragma: no cover - 防御性
                     break
                 (
                     rewritten,
@@ -732,7 +1048,36 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                     return ProxyResponseResult(False, usage)
                 if finalized:
                     break
+            if aborted:
+                self._send_stream_abort_tail(
+                    accumulator, original_model, abort_reason, trace
+                )
         finally:
+            # 读取线程可能已经读到但主线程尚未消费的行：先排空，
+            # 让 reasoning 缓存包含断流前的最后几个 chunk。
+            while True:
+                kind, line = reader.poll(0.02)
+                if kind != "line" or line is None:
+                    break
+                try:
+                    (
+                        _rewritten,
+                        finalized,
+                        pending_recovery_notice,
+                        _chunk_usage,
+                    ) = self._rewrite_sse_line(
+                        line,
+                        original_model,
+                        accumulator,
+                        cache_namespace,
+                        response_contexts,
+                        display_adapter,
+                        pending_recovery_notice,
+                        trace,
+                    )
+                except Exception:  # noqa: BLE001 - 排空只是尽力而为
+                    break
+            reader.shutdown()
             # 当流在上游 [DONE] 终止符之前退出时（客户端断开、上游读取失败、
             # 异常），存储部分 reasoning。否则，中途按停止会丢弃代理已收到但未缓存的 reasoning。
             if not finalized:
@@ -740,21 +1085,85 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                     log_json(
                         "模型流式助手消息", accumulator.messages()
                     )
-                stored = sum(
-                    accumulator.store_reasoning(
-                        self.reasoning_store,
-                        ctx_scope,
-                        cache_namespace,
-                        prior_messages,
-                    )
-                    for ctx_scope, prior_messages in response_contexts
+                stored = self._store_streaming_reasoning_safely(
+                    accumulator,
+                    "final",
+                    response_contexts,
+                    cache_namespace,
                 )
                 if self.config.verbose and stored:
                     LOG.info(
                         "退出前已存储 %s 个流式 reasoning 缓存键",
                         stored,
                     )
+        if aborted:
+            return ProxyResponseResult(False, usage, aborted=True)
         return ProxyResponseResult(True, usage)
+
+    def _send_stream_abort_tail(
+        self,
+        accumulator: StreamAccumulator,
+        original_model: str,
+        reason: str | None,
+        trace: TraceRequest | None = None,
+    ) -> None:
+        """上游流中断时补发明确的结束信号，避免 Cursor 只看到无声断流。"""
+        has_partial_tool_calls = any(
+            choice.tool_calls for choice in accumulator.choices.values()
+        )
+        if has_partial_tool_calls:
+            # 工具调用参数可能不完整，不能伪装成正常结束，否则 Cursor
+            # 会执行一个残缺的工具调用。
+            payload = {
+                "error": {
+                    "message": f"上游流在完成前中断：{reason or '连接中断'}",
+                    "type": "upstream_stream_aborted",
+                    "code": "upstream_stream_aborted",
+                }
+            }
+            tail = sse_data(payload) + b"data: [DONE]\n\n"
+            context = "发送流式中断错误"
+        else:
+            tail = sse_data(abort_finish_chunk(original_model)) + b"data: [DONE]\n\n"
+            context = "发送流式结束帧"
+        if self._write_to_client(tail, context, flush=True) and trace is not None:
+            try:
+                trace.record_stream_chunk(b"", tail)
+            except OSError as exc:
+                LOG.warning("写入请求追踪失败: %s", exc)
+
+    def _store_streaming_reasoning_safely(
+        self,
+        accumulator: StreamAccumulator,
+        stage: str,
+        response_contexts: list[tuple[str, list[dict[str, Any]]]],
+        cache_namespace: str,
+    ) -> int:
+        """存储流式 reasoning；缓存故障不应中断正在进行的响应。
+
+        stage 为 "final" 时存储完整 assistant 消息，为 "tool_call" 时
+        只存储已能识别的工具调用。
+        """
+        stored = 0
+        for scope, prior_messages in response_contexts:
+            try:
+                if stage == "final":
+                    stored += accumulator.store_reasoning(
+                        self.reasoning_store,
+                        scope,
+                        cache_namespace,
+                        prior_messages,
+                    )
+                else:
+                    stored += accumulator.store_ready_reasoning(
+                        self.reasoning_store,
+                        scope,
+                        cache_namespace,
+                        prior_messages,
+                    )
+            except sqlite3.Error as exc:
+                LOG.warning("写入 reasoning 缓存失败（已忽略）: %s", exc)
+        return stored
 
     def _rewrite_sse_line(
         self,
@@ -775,14 +1184,11 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
         if data == b"[DONE]":
             if self.config.verbose:
                 log_json("模型流式助手消息", accumulator.messages())
-            stored = sum(
-                accumulator.store_reasoning(
-                    self.reasoning_store,
-                    scope,
-                    cache_namespace,
-                    prior_messages,
-                )
-                for scope, prior_messages in response_contexts
+            stored = self._store_streaming_reasoning_safely(
+                accumulator,
+                "final",
+                response_contexts,
+                cache_namespace,
             )
             if self.config.verbose and stored:
                 LOG.info("已存储 %s 个流式 reasoning 缓存键", stored)
@@ -811,14 +1217,11 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
             if recovery_notice and inject_recovery_notice(chunk, recovery_notice):
                 recovery_notice = None
             accumulator.ingest_chunk(chunk)
-            stored = sum(
-                accumulator.store_ready_reasoning(
-                    self.reasoning_store,
-                    scope,
-                    cache_namespace,
-                    prior_messages,
-                )
-                for scope, prior_messages in response_contexts
+            stored = self._store_streaming_reasoning_safely(
+                accumulator,
+                "tool_call",
+                response_contexts,
+                cache_namespace,
             )
             if self.config.verbose and stored:
                 LOG.info("已存储 %s 个流式 reasoning 缓存键", stored)
@@ -956,6 +1359,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--max-request-body-bytes",
         type=int,
         help="最大可接受请求体大小，默认来自配置",
+    )
+    parser.add_argument(
+        "--stream-idle-ping-seconds",
+        type=float,
+        help=(
+            "上游流静默超过该秒数时发送 SSE keep-alive 注释行（0 关闭），"
+            "默认来自配置或 15"
+        ),
     )
     parser.add_argument(
         "--reasoning-cache-max-age-seconds",
@@ -1206,6 +1617,23 @@ def recovery_notice_chunk(
     }
 
 
+def abort_finish_chunk(model: str) -> dict[str, Any]:
+    """上游流中断时补发的结束帧：已有部分内容送达，按提前 stop 处理。"""
+    return {
+        "id": "chatcmpl-deepseek-cursor-proxy-abort",
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "delta": {},
+                "finish_reason": "stop",
+            }
+        ],
+    }
+
+
 def summarize_chat_payload(payload: dict[str, Any]) -> str:
     messages = payload.get("messages")
     tools = payload.get("tools")
@@ -1292,6 +1720,8 @@ def main(argv: list[str] | None = None) -> int:
         updates["request_timeout"] = args.request_timeout
     if args.max_request_body_bytes is not None:
         updates["max_request_body_bytes"] = args.max_request_body_bytes
+    if args.stream_idle_ping_seconds is not None:
+        updates["stream_idle_ping_seconds"] = args.stream_idle_ping_seconds
     if args.reasoning_cache_max_age_seconds is not None:
         updates["reasoning_cache_max_age_seconds"] = (
             args.reasoning_cache_max_age_seconds

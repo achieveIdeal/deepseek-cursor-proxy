@@ -14,6 +14,7 @@ from deepseek_cursor_proxy.config import (
     DEFAULT_PORT,
     DEFAULT_REASONING_CACHE_MAX_AGE_SECONDS,
     DEFAULT_REASONING_CACHE_MAX_ROWS,
+    DEFAULT_STREAM_IDLE_PING_SECONDS,
     DEFAULT_THINKING,
     DEFAULT_UPSTREAM_MODEL,
     DEFAULT_VERBOSE,
@@ -78,7 +79,9 @@ class ConfigTests(unittest.TestCase):
                 f"{str(DEFAULT_COLLAPSIBLE_REASONING).lower()}",
                 config_text,
             )
-            self.assertEqual(stat.S_IMODE(config_path.stat().st_mode), 0o600)
+            # Windows 的 chmod 只有只读位语义，st_mode 不是 0o600；权限断言仅 POSIX 有意义。
+            if os.name == "posix":
+                self.assertEqual(stat.S_IMODE(config_path.stat().st_mode), 0o600)
             self.assertEqual(config.upstream_model, DEFAULT_UPSTREAM_MODEL)
             self.assertEqual(config.ngrok, DEFAULT_NGROK)
             self.assertEqual(
@@ -130,6 +133,7 @@ class ConfigTests(unittest.TestCase):
                         "verbose: true",
                         "request_timeout: 123.5",
                         "max_request_body_bytes: 1234",
+                        "stream_idle_ping_seconds: 2.5",
                         "cors: true",
                         "display_reasoning: false",
                         "collasible_reasoning: false",
@@ -155,6 +159,7 @@ class ConfigTests(unittest.TestCase):
         self.assertTrue(config.verbose)
         self.assertEqual(config.request_timeout, 123.5)
         self.assertEqual(config.max_request_body_bytes, 1234)
+        self.assertEqual(config.stream_idle_ping_seconds, 2.5)
         self.assertTrue(config.cors)
         self.assertFalse(config.display_reasoning)
         self.assertFalse(config.collapsible_reasoning)
@@ -175,6 +180,7 @@ class ConfigTests(unittest.TestCase):
                         "port: nope",
                         "verbose: maybe",
                         "collasible_reasoning: maybe",
+                        "stream_idle_ping_seconds: nope",
                     ]
                 ),
                 encoding="utf-8",
@@ -192,6 +198,9 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(
             config.collapsible_reasoning,
             DEFAULT_COLLAPSIBLE_REASONING,
+        )
+        self.assertEqual(
+            config.stream_idle_ping_seconds, DEFAULT_STREAM_IDLE_PING_SECONDS
         )
 
     def test_ngrok_url_empty_or_whitespace_is_none(self) -> None:
@@ -259,21 +268,23 @@ class ConfigTests(unittest.TestCase):
             config_path = Path(temp_dir) / "config.yaml"
             config_path.write_text("verbose: false\n", encoding="utf-8")
 
-        with patch.dict(
-            "os.environ",
-            {
-                "PROXY_VERBOSE": "true",
-                "DEEPSEEK_CURSOR_PROXY_CONFIG_PATH": "/ignored.yaml",
-            },
-            clear=True,
-        ):
+        env = {
+            "PROXY_VERBOSE": "true",
+            "DEEPSEEK_CURSOR_PROXY_CONFIG_PATH": "/ignored.yaml",
+        }
+        if os.name == "nt":
+            # Windows 上 pathlib.Path.home() 依赖 USERPROFILE（以及 HOMEDRIVE/HOMEPATH），
+            # 清空环境变量会让它抛 RuntimeError，和本用例想验证的行为无关。
+            for key in ("USERPROFILE", "HOMEDRIVE", "HOMEPATH", "SYSTEMROOT"):
+                if key in os.environ:
+                    env[key] = os.environ[key]
+
+        with patch.dict("os.environ", env, clear=True):
             config = ProxyConfig.from_file(config_path=config_path)
+            # 代理不得消费或改写进程环境变量。
+            self.assertEqual(os.environ.get("PROXY_VERBOSE"), "true")
             self.assertEqual(
-                dict(os.environ),
-                {
-                    "PROXY_VERBOSE": "true",
-                    "DEEPSEEK_CURSOR_PROXY_CONFIG_PATH": "/ignored.yaml",
-                },
+                os.environ.get("DEEPSEEK_CURSOR_PROXY_CONFIG_PATH"), "/ignored.yaml"
             )
 
         self.assertFalse(config.verbose)
