@@ -141,6 +141,32 @@ class StreamAccumulator:
     def messages(self) -> list[dict[str, Any]]:
         return [choice.to_message() for _, choice in sorted(self.choices.items())]
 
+    def has_received_finish_reason(self) -> bool:
+        """所有已解析的 choice 是否都已收到 finish_reason。
+
+        上游偶发漏发 [DONE] 就关闭连接；此时若模型已给出 finish_reason，
+        说明生成已完成，EOF 只是传输层收尾缺失。
+        """
+        if not self.choices:
+            return False
+        return all(
+            choice.finish_reason is not None for choice in self.choices.values()
+        )
+
+    def progress_summary(self) -> str:
+        """EOF/断流诊断：每个 choice 已积累的内容规模与结束状态。"""
+        if not self.choices:
+            return "未解析到任何流式内容"
+        return "；".join(
+            (
+                f"choice[{index}] content_chars={len(choice.content)} "
+                f"reasoning_chars={len(choice.reasoning_content)} "
+                f"tool_calls={len(choice.tool_calls)} "
+                f"finish_reason={choice.finish_reason!r}"
+            )
+            for index, choice in sorted(self.choices.items())
+        )
+
     def _merge_tool_call_deltas(self, choice: StreamingChoice, deltas: Any) -> None:
         if not isinstance(deltas, list):
             return

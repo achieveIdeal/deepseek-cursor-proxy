@@ -787,11 +787,12 @@ class RecoveryTests(_StrictUpstreamCase):
 # ---------------------------------------------------------------------------
 
 
-def _sse_chunks(*chunks: dict[str, Any]) -> bytes:
+def _sse_chunks(*chunks: dict[str, Any], include_done: bool = True) -> bytes:
     out = b""
     for chunk in chunks:
         out += f"data: {json.dumps(chunk)}\n\n".encode("utf-8")
-    out += b"data: [DONE]\n\n"
+    if include_done:
+        out += b"data: [DONE]\n\n"
     return out
 
 
@@ -1456,6 +1457,214 @@ class StreamingCacheTimingTests(unittest.TestCase):
             payload["choices"][0]["message"]["content"].split("</details>")[-1],
             "\n\nfollow-up accepted",
         )
+
+
+# ---------------------------------------------------------------------------
+# Upstream stream termination anomalies: missing [DONE] and in-stream errors.
+# ---------------------------------------------------------------------------
+
+
+class _MissingDoneStreamHandler(BaseHTTPRequestHandler):
+    """流式返回完整回答与 finish_reason，但省略 [DONE] 就关闭连接。"""
+
+    def log_message(self, fmt: str, *args: Any) -> None:
+        return
+
+    def do_POST(self) -> None:
+        length = int(self.headers.get("Content-Length") or 0)
+        self.rfile.read(length)
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.end_headers()
+        self.wfile.write(
+            _sse_chunks(
+                {
+                    "id": "stream-nodone",
+                    "object": "chat.completion.chunk",
+                    "created": 1,
+                    "model": "deepseek-v4-pro",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {
+                                "role": "assistant",
+                                "reasoning_content": "Need ",
+                            },
+                            "finish_reason": None,
+                        }
+                    ],
+                },
+                {
+                    "id": "stream-nodone",
+                    "object": "chat.completion.chunk",
+                    "created": 1,
+                    "model": "deepseek-v4-pro",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"content": "Final answer."},
+                            "finish_reason": None,
+                        }
+                    ],
+                },
+                {
+                    "id": "stream-nodone",
+                    "object": "chat.completion.chunk",
+                    "created": 1,
+                    "model": "deepseek-v4-pro",
+                    "choices": [
+                        {"index": 0, "delta": {}, "finish_reason": "stop"}
+                    ],
+                },
+                include_done=False,
+            )
+        )
+        self.wfile.flush()
+
+
+class _AbortedStreamHandler(BaseHTTPRequestHandler):
+    """思考内容写到一半就断开（无 finish_reason、无 [DONE]）。"""
+
+    def log_message(self, fmt: str, *args: Any) -> None:
+        return
+
+    def do_POST(self) -> None:
+        length = int(self.headers.get("Content-Length") or 0)
+        self.rfile.read(length)
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.end_headers()
+        self.wfile.write(
+            _sse_chunks(
+                {
+                    "id": "stream-abort",
+                    "object": "chat.completion.chunk",
+                    "created": 1,
+                    "model": "deepseek-v4-pro",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {
+                                "role": "assistant",
+                                "reasoning_content": "Half a thought",
+                            },
+                            "finish_reason": None,
+                        }
+                    ],
+                },
+                include_done=False,
+            )
+        )
+        self.wfile.flush()
+
+
+class _StreamErrorChunkHandler(BaseHTTPRequestHandler):
+    """SSE 流内下发 error 对象后直接关闭连接。"""
+
+    def log_message(self, fmt: str, *args: Any) -> None:
+        return
+
+    def do_POST(self) -> None:
+        length = int(self.headers.get("Content-Length") or 0)
+        self.rfile.read(length)
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.end_headers()
+        self.wfile.write(
+            _sse_chunks(
+                {"error": {"message": "upstream exploded", "code": "boom"}},
+                include_done=False,
+            )
+        )
+        self.wfile.flush()
+
+
+class _StreamAnomalyCase(unittest.TestCase):
+    """Common setup for upstream stream-termination anomaly tests."""
+
+    handler: type[BaseHTTPRequestHandler]
+
+    def setUp(self) -> None:
+        self.upstream = _Fixture(
+            ThreadingHTTPServer(("127.0.0.1", 0), self.handler)
+        )
+        self.store = ReasoningStore(":memory:")
+        self.proxy = _start_proxy(self.upstream.url, self.store)
+
+    def tearDown(self) -> None:
+        self.proxy.close()
+        self.upstream.close()
+        self.store.close()
+
+    def _stream(self) -> str:
+        request = Request(
+            f"{self.proxy.url}/v1/chat/completions",
+            data=json.dumps(
+                {
+                    "model": "deepseek-v4-pro",
+                    "stream": True,
+                    "messages": [{"role": "user", "content": "stream"}],
+                }
+            ).encode("utf-8"),
+            method="POST",
+            headers={
+                "Authorization": "Bearer sk-test",
+                "Content-Type": "application/json",
+            },
+        )
+        with urlopen(request, timeout=5) as response:
+            return response.read().decode("utf-8")
+
+
+class MissingDoneStreamTests(_StreamAnomalyCase):
+    handler = _MissingDoneStreamHandler
+
+    def test_missing_done_after_finish_reason_is_treated_as_completed(self) -> None:
+        with self.assertLogs("deepseek_cursor_proxy", level="INFO") as logs:
+            body = self._stream()
+
+        joined = "\n".join(logs.output)
+        self.assertIn("未发送 [DONE]", joined)
+        self.assertIn("按完成处理", joined)
+        # 内容完整送达，思考块正常闭合。
+        self.assertIn("Final answer.", body)
+        self.assertIn("</details>", body)
+        # 代理补发 SSE 终止符，客户端不会看到无声断流。
+        self.assertIn("data: [DONE]", body)
+
+
+class AbortedStreamDiagnosticsTests(_StreamAnomalyCase):
+    handler = _AbortedStreamHandler
+
+    def test_aborted_stream_logs_progress_and_closes_reasoning_block(self) -> None:
+        with self.assertLogs("deepseek_cursor_proxy", level="WARNING") as logs:
+            body = self._stream()
+
+        joined = "\n".join(logs.output)
+        self.assertIn("上游流提前结束", joined)
+        # 诊断摘要包含每个 choice 的进度与结束状态。
+        self.assertIn("reasoning_chars=", joined)
+        self.assertIn("finish_reason=None", joined)
+        # 未闭合的思考块被收尾关闭。
+        self.assertIn("</details>", body)
+        # 补发结束帧 + 终止符，Cursor 看到的是明确结束。
+        self.assertIn('"finish_reason":"stop"', body)
+        self.assertIn("data: [DONE]", body)
+
+
+class StreamErrorChunkTests(_StreamAnomalyCase):
+    handler = _StreamErrorChunkHandler
+
+    def test_in_stream_error_is_logged_and_forwarded(self) -> None:
+        with self.assertLogs("deepseek_cursor_proxy", level="WARNING") as logs:
+            body = self._stream()
+
+        joined = "\n".join(logs.output)
+        self.assertIn("上游流式响应携带错误", joined)
+        self.assertIn("upstream exploded", joined)
+        self.assertIn("code=boom", joined)
+        # error 对象按原样透传给客户端。
+        self.assertIn("upstream exploded", body)
 
 
 if __name__ == "__main__":

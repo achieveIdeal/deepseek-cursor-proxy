@@ -1,7 +1,7 @@
 <!-- <h1><img src="assets/logo.png" width="120" alt="deepseek-cursor-proxy logo" style="vertical-align: middle;">&nbsp;DeepSeek Cursor Proxy</h1> -->
 <h1 align="center"><img src="assets/logo.png" width="150" alt="deepseek-cursor-proxy logo"><br>DeepSeek Cursor 代理</h1>
 
-一个兼容性代理，通过正确处理 DeepSeek 工具调用推理 API 请求中的 `reasoning_content` 字段，将 Cursor 连接到 DeepSeek 思考模型（`deepseek-v4-pro` 和 `deepseek-v4-flash`）。还支持把 Cursor 中发送的图片转发给 DeepSeek 视觉模型（`deepseek-v4-flash-vision-exp` / `deepseek-flash`）。
+一个兼容性代理，通过正确处理 DeepSeek 工具调用推理 API 请求中的 `reasoning_content` 字段，将 Cursor 连接到 DeepSeek 思考模型（`deepseek-v4-pro` 和 `deepseek-v4-flash`）。还支持把 Cursor 中发送的图片转发给 DeepSeek 视觉模型（`deepseek-v4-flash-vision-exp` / `deepseek-flash`）。   
 
 此代理还可以帮助 **Cursor 以外的其他应用和编程代理**，当它们遇到 DeepSeek 思考模式 API 中缺少 `reasoning_content` 的相同问题时。只需将它们的 API 基础 URL 指向此代理即可。
 
@@ -198,6 +198,16 @@ deepseek-cursor-proxy --verbose --trace-dir ./trace-dumps
 ```bash
 deepseek-cursor-proxy --config ./dev.config.yaml
 ```
+
+### 排查「上游流提前结束」
+
+流式响应中若出现 `上游流提前结束（未收到 [DONE]…）`，说明上游在未发送 `data: [DONE]` 的情况下关闭了连接，代理已按情况补发结束帧：
+
+- 日志附带的 `choice[0] content_chars=… reasoning_chars=… tool_calls=… finish_reason=…` 是切断瞬间已收到的内容规模。`finish_reason=None` 表示模型未生成完毕（真中断，回答会截断）；若所有 choice 都已收到 `finish_reason`，代理按正常完成处理并补发 `[DONE]`，内容通常完整。
+- `上游流式响应携带错误: …（code=…）` 表示上游在 SSE 流内下发了 `error` 对象，错误信息已透传给 Cursor。
+- 存在残缺工具调用时，代理改发 `upstream_stream_aborted` 错误帧（避免 Cursor 执行残缺工具调用）；否则补发 `finish_reason=stop` 结束帧并闭合未完成的思考块，Cursor 不会看到无声断流。
+
+若中断频繁出现，用 `--verbose --trace-dir ./trace-dumps` 复现一次：trace 文件中的最后一个 chunk 和上游响应头可以区分是超时、流内错误还是限流。
 
 清除本地 reasoning 缓存：
 

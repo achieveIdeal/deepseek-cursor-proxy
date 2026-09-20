@@ -1014,11 +1014,34 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                     continue
                 if kind == "eof":
                     if not finalized:
-                        aborted = True
-                        abort_reason = "上游流未发送 [DONE] 就关闭了连接"
-                        LOG.warning(
-                            "上游流提前结束（未收到 [DONE]），已向客户端补发结束帧"
-                        )
+                        if accumulator.has_received_finish_reason():
+                            # 上游漏发 [DONE] 就关闭连接：模型已完成生成，
+                            # 只需补齐思考块收尾与 SSE 终止符。
+                            LOG.info(
+                                "上游流未发送 [DONE] 就关闭了连接；已收到 "
+                                "finish_reason，按完成处理并补发终止符（%s）",
+                                accumulator.progress_summary(),
+                            )
+                            closing = self._stream_closing_bytes(
+                                display_adapter,
+                                original_model,
+                                pending_recovery_notice,
+                            )
+                            pending_recovery_notice = None
+                            if not self._write_to_client(
+                                closing + b"data: [DONE]\n\n",
+                                "发送流终止符",
+                                flush=True,
+                            ):
+                                return ProxyResponseResult(False, usage)
+                        else:
+                            aborted = True
+                            abort_reason = "上游流未发送 [DONE] 就关闭了连接"
+                            LOG.warning(
+                                "上游流提前结束（未收到 [DONE]，且无 "
+                                "finish_reason），已向客户端补发结束帧：%s",
+                                accumulator.progress_summary(),
+                            )
                     break
                 if kind == "error":
                     aborted = True
@@ -1054,7 +1077,12 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                     break
             if aborted:
                 self._send_stream_abort_tail(
-                    accumulator, original_model, abort_reason, trace
+                    accumulator,
+                    original_model,
+                    abort_reason,
+                    trace,
+                    display_adapter=display_adapter,
+                    recovery_notice=pending_recovery_notice,
                 )
         finally:
             # 读取线程可能已经读到但主线程尚未消费的行：先排空，
@@ -1104,16 +1132,37 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
             return ProxyResponseResult(False, usage, aborted=True)
         return ProxyResponseResult(True, usage)
 
+    def _stream_closing_bytes(
+        self,
+        display_adapter: CursorReasoningDisplayAdapter | None,
+        original_model: str,
+        recovery_notice: str | None,
+    ) -> bytes:
+        """流结束时补发的收尾字节：关闭未闭合的思考块 + 恢复提示。"""
+        closing = b""
+        if display_adapter is not None:
+            closing_chunk = display_adapter.flush_chunk(original_model)
+            if closing_chunk is not None:
+                closing += sse_data(closing_chunk)
+        if recovery_notice:
+            closing += sse_data(recovery_notice_chunk(original_model, recovery_notice))
+        return closing
+
     def _send_stream_abort_tail(
         self,
         accumulator: StreamAccumulator,
         original_model: str,
         reason: str | None,
         trace: TraceRequest | None = None,
+        display_adapter: CursorReasoningDisplayAdapter | None = None,
+        recovery_notice: str | None = None,
     ) -> None:
         """上游流中断时补发明确的结束信号，避免 Cursor 只看到无声断流。"""
         has_partial_tool_calls = any(
             choice.tool_calls for choice in accumulator.choices.values()
+        )
+        closing = self._stream_closing_bytes(
+            display_adapter, original_model, recovery_notice
         )
         if has_partial_tool_calls:
             # 工具调用参数可能不完整，不能伪装成正常结束，否则 Cursor
@@ -1125,10 +1174,14 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                     "code": "upstream_stream_aborted",
                 }
             }
-            tail = sse_data(payload) + b"data: [DONE]\n\n"
+            tail = closing + sse_data(payload) + b"data: [DONE]\n\n"
             context = "发送流式中断错误"
         else:
-            tail = sse_data(abort_finish_chunk(original_model)) + b"data: [DONE]\n\n"
+            tail = (
+                closing
+                + sse_data(abort_finish_chunk(original_model))
+                + b"data: [DONE]\n\n"
+            )
             context = "发送流式结束帧"
         if self._write_to_client(tail, context, flush=True) and trace is not None:
             try:
@@ -1218,6 +1271,11 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
             return line, False, recovery_notice, None
 
         if isinstance(chunk, dict):
+            error = chunk.get("error")
+            if error is not None:
+                # 上游可能在 SSE 流内下发 error 对象后关闭连接；
+                # 代理只能透传，但必须留下告警便于定位断流原因。
+                LOG.warning("上游流式响应携带错误: %s", stream_error_text(error))
             if recovery_notice and inject_recovery_notice(chunk, recovery_notice):
                 recovery_notice = None
             accumulator.ingest_chunk(chunk)
@@ -1601,6 +1659,17 @@ def sse_data(payload: dict[str, Any]) -> bytes:
         + json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         + b"\n\n"
     )
+
+
+def stream_error_text(error: Any) -> str:
+    """把上游流内的 error 对象压成单行日志文本。"""
+    if isinstance(error, dict):
+        message = error.get("message")
+        code = error.get("code") or error.get("type")
+        if isinstance(message, str) and message:
+            return f"{message}（code={code}）" if code else message
+        return json.dumps(error, ensure_ascii=False)[:300]
+    return str(error)[:300]
 
 
 def inject_recovery_notice(chunk: dict[str, Any], notice: str) -> bool:
